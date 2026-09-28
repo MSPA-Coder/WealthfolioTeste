@@ -1,0 +1,31 @@
+{
+  "id": "controle-patrimonial-sync",
+  "name": "Controle Patrimonial",
+  "version": "0.1.0",
+  "description": "Imports read-only CB and CRV v4 snapshots into Wealthfolio.",
+  "author": "MSPA",
+  "main": "dist/addon.js",
+  "sdkVersion": "3.9.0",
+  "minWealthfolioVersion": "3.9.0",
+  "enabled": true,
+  "contributes": {
+    "routes": [{ "id": "controle-patrimonial-sync" }],
+    "links": { "sidebar": [{ "id": "controle-patrimonial-sync", "route": "controle-patrimonial-sync", "label": "Controle Patrimonial", "icon": "arrows-clockwise", "order": 90 }] }
+  },
+  "hostDependencies": {
+    "@tanstack/react-query": "^5.90.0",
+    "@wealthfolio/addon-sdk": "^3.9.0",
+    "@wealthfolio/ui": "^3.9.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "network": { "allowedHosts": ["host.docker.internal", "cb-api", "crv-api"] },
+  "permissions": [
+    { "category": "accounts", "functions": ["getAll", "create"], "purpose": "Create and find accounts mapped from CB and CRV." },
+    { "category": "snapshots", "functions": ["save"], "purpose": "Replace the current holdings or cash snapshot idempotently." },
+    { "category": "secrets", "functions": ["set"], "purpose": "Keep each source Bearer token outside addon code and storage." },
+    { "category": "network", "functions": ["request"], "purpose": "Read the explicitly approved local CB and CRV v4 APIs." }
+  ],
+  "keywords": ["wealthfolio", "controle-bancario", "controle-renda-variavel"],
+  "license": "MIT"
+}

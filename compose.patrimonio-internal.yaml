@@ -1,0 +1,20 @@
+# Override exclusivo do VPS: usa a rede Docker interna compartilhada com CB e
+# CRV. Crie a rede uma vez antes de subir os três Compose projects:
+#   docker network create --internal patrimonio-internal
+#
+# Não aplique este override ao Docker Desktop local; lá os aliases cb-api e
+# crv-api não existem e o compose base usa host.docker.internal.
+services:
+  wealthfolio:
+    networks:
+      default: {}
+      patrimonio-internal:
+        aliases:
+          - wealthfolio-patrimonio
+    environment:
+      WF_ADDON_NETWORK_PRIVATE_TARGETS: "http://cb-api:8000/patrimonio/v4,http://crv-api:5003/patrimonio/v4"
+
+networks:
+  patrimonio-internal:
+    name: patrimonio-internal
+    external: true

@@ -1,0 +1,42 @@
+name: wealthfolio-teste
+
+services:
+  wealthfolio:
+    image: wealthfolio-teste:3.9.1-local
+    build:
+      context: ../CodexTemp/wealthfolio-v3.9.1
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18088:8088"
+    volumes:
+      - wealthfolio-teste-data:/data
+      - type: bind
+        source: "${WF_SECRET_KEY_HOST_PATH:?Set WF_SECRET_KEY_HOST_PATH in the local .env file}"
+        target: /run/secrets/wealthfolio_master_key
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      WF_LISTEN_ADDR: "0.0.0.0:8088"
+      WF_DB_PATH: "/data/wealthfolio.db"
+      WF_SECRET_KEY: ""
+      WF_SECRET_KEY_FILE: /run/secrets/wealthfolio_master_key
+      WF_AUTH_PASSWORD_HASH: "${WF_AUTH_PASSWORD_HASH:?Set WF_AUTH_PASSWORD_HASH in the local .env file}"
+      WF_DB_REQUIRE_ENCRYPTION: "1"
+      WF_ADDON_NETWORK_PRIVATE_TARGETS: "${WF_ADDON_NETWORK_PRIVATE_TARGETS:-}"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8088/api/v1/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M
+
+volumes:
+  wealthfolio-teste-data:
+    name: wealthfolio-teste-data
+    driver: local

@@ -1,0 +1,12 @@
+name: wealthfolio-addon-build
+
+# Build do pacote instalável sem Node.js no host. O artefato aparece em
+# addons/controle-patrimonial-sync/release/ e deve ser carregado pela tela
+# Settings > Addons da instância Wealthfolio.
+services:
+  addon-build:
+    image: node:24-alpine
+    working_dir: /workspace
+    volumes:
+      - ./addons/controle-patrimonial-sync:/workspace
+    command: ["sh", "-ec", "apk add --no-cache zip && npm ci && npm run bundle"]
