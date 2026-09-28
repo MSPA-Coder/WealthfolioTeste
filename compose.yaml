@@ -22,6 +22,8 @@ services:
       WF_SECRET_KEY: ""
       WF_SECRET_KEY_FILE: /run/secrets/wealthfolio_master_key
       WF_AUTH_PASSWORD_HASH: "${WF_AUTH_PASSWORD_HASH:?Set WF_AUTH_PASSWORD_HASH in the local .env file}"
+      WF_CORS_ALLOW_ORIGINS: "https://networth-mspa.duckdns.org"
+      WF_COOKIE_SECURE: "true"
       WF_DB_REQUIRE_ENCRYPTION: "1"
       WF_ADDON_NETWORK_PRIVATE_TARGETS: "${WF_ADDON_NETWORK_PRIVATE_TARGETS:-}"
     healthcheck:
