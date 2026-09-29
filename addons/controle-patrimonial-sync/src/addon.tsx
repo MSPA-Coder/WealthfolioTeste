@@ -101,8 +101,11 @@ interface CachedCrvRecords {
   snapshotId: string;
   income: CrvIncome[];
   ledger: SourceRecord[];
+  closedActivities: SourceRecord[];
   incomeCoverage: Record<string, unknown>;
   ledgerCoverage: Record<string, unknown>;
+  activitiesCoverage: Record<string, unknown>;
+  activitiesTotal: number;
   ledgerComplete: boolean;
 }
 
@@ -111,6 +114,16 @@ interface LedgerEnvelope {
   sistema?: string;
   coverage?: Record<string, unknown>;
   paginacao?: { pagina?: number; tem_proxima?: boolean; total?: number };
+  itens?: SourceRecord[];
+}
+
+interface ActivitiesEnvelope {
+  contrato?: string;
+  recurso?: string;
+  sistema?: string;
+  high_watermark?: string;
+  coverage?: Record<string, unknown>;
+  paginacao?: { pagina?: number; total?: number; tem_proxima?: boolean };
   itens?: SourceRecord[];
 }
 
@@ -292,7 +305,24 @@ async function fetchSnapshot(
   if (system === 'controle-bancario' && !Array.isArray(snapshot.items)) {
     throw new Error(SANITIZED_FAILURE);
   }
+  if (system === 'controle-bancario') {
+    const itemCount = (resource: string) => snapshot.items!.filter((item) => item.resource === resource).length;
+    if (snapshot.coverage?.cash_entry?.state !== 'complete'
+      || snapshot.coverage.cash_entry.count !== itemCount('cash_entry')
+      || snapshot.coverage.account?.state !== 'complete'
+      || snapshot.coverage.account.count !== itemCount('account')
+      || snapshot.coverage.category?.state !== 'complete'
+      || snapshot.coverage.category.count !== itemCount('category')) {
+      throw new Error(SANITIZED_FAILURE);
+    }
+  }
   if (system === 'controle-renda-variavel' && !Array.isArray(snapshot.holdings)) {
+    throw new Error(SANITIZED_FAILURE);
+  }
+  if (system === 'controle-renda-variavel'
+    && (!Array.isArray(snapshot.income)
+      || snapshot.coverage?.income?.included !== snapshot.income.length
+      || snapshot.coverage?.holdings?.complete !== true)) {
     throw new Error(SANITIZED_FAILURE);
   }
   if (system === 'controle-renda-variavel' && snapshot.holdings?.some((holding) => holding.instrument_type !== 'equity')) {
@@ -304,6 +334,7 @@ async function fetchSnapshot(
 async function fetchCrvLedger(ctx: AddonContext): Promise<{ items: SourceRecord[]; coverage: Record<string, unknown> }> {
   const items: SourceRecord[] = [];
   let coverage: Record<string, unknown> = {};
+  let expectedTotal: number | null = null;
   let page = 1;
   while (true) {
     const response = await requestFromSource(ctx, CRV_BASE_URLS, `/ledger?page=${page}&page_size=100`, CRV_TOKEN_KEY);
@@ -315,16 +346,79 @@ async function fetchCrvLedger(ctx: AddonContext): Promise<{ items: SourceRecord[
       throw new Error(SANITIZED_FAILURE);
     }
     if (body.contrato !== 'patrimonio/v4' || body.sistema !== 'controle-renda-variavel'
-      || !Array.isArray(body.itens) || body.paginacao?.pagina !== page) {
+      || !Array.isArray(body.itens) || body.paginacao?.pagina !== page
+      || typeof body.paginacao.total !== 'number' || !body.coverage
+      || typeof body.coverage.completeness !== 'string' || typeof body.coverage.backfill !== 'boolean') {
       throw new Error(SANITIZED_FAILURE);
     }
+    if (expectedTotal !== null && body.paginacao.total !== expectedTotal) throw new Error(SANITIZED_FAILURE);
+    expectedTotal = body.paginacao.total;
     coverage = body.coverage ?? {};
     items.push(...body.itens);
     if (!body.paginacao.tem_proxima) break;
     page += 1;
     if (page > 1000) throw new Error(SANITIZED_FAILURE);
   }
+  if (items.length !== expectedTotal) throw new Error(SANITIZED_FAILURE);
   return { items, coverage };
+}
+
+async function fetchCrvActivities(ctx: AddonContext): Promise<{
+  closedActivities: SourceRecord[];
+  coverage: Record<string, unknown>;
+  total: number;
+  highWatermark: string;
+}> {
+  const closedActivities: SourceRecord[] = [];
+  let coverage: Record<string, unknown> = {};
+  let total = 0;
+  let expectedRows: number | null = null;
+  let expectedTransactions: number | null = null;
+  let expectedIncome: number | null = null;
+  let expectedWatermark: string | null = null;
+  let page = 1;
+  while (true) {
+    const response = await requestFromSource(ctx, CRV_BASE_URLS, `/activities?page=${page}&page_size=100`, CRV_TOKEN_KEY);
+    if (response.status !== 200) throw new Error(SANITIZED_FAILURE);
+    let body: ActivitiesEnvelope;
+    try {
+      body = JSON.parse(response.body) as ActivitiesEnvelope;
+    } catch {
+      throw new Error(SANITIZED_FAILURE);
+    }
+    if (body.contrato !== 'patrimonio/v4' || body.recurso !== 'activities'
+      || body.sistema !== 'controle-renda-variavel' || !Array.isArray(body.itens)
+      || body.paginacao?.pagina !== page || typeof body.paginacao.total !== 'number'
+      || !body.coverage || typeof body.coverage.complete !== 'boolean'
+      || typeof body.coverage.closed_transactions_included !== 'number'
+      || typeof body.coverage.income_included !== 'number'
+      || typeof body.high_watermark !== 'string') {
+      throw new Error(SANITIZED_FAILURE);
+    }
+    if (expectedRows !== null && (body.paginacao.total !== expectedRows
+      || body.coverage.closed_transactions_included !== expectedTransactions
+      || body.coverage.income_included !== expectedIncome
+      || body.high_watermark !== expectedWatermark)) {
+      throw new Error(SANITIZED_FAILURE);
+    }
+    coverage = body.coverage;
+    total = body.paginacao.total;
+    expectedRows = body.paginacao.total;
+    expectedTransactions = body.coverage.closed_transactions_included;
+    expectedIncome = body.coverage.income_included;
+    expectedWatermark = body.high_watermark;
+    closedActivities.push(...body.itens.filter((item) => item.origem === 'transacao'));
+    if (!body.paginacao.tem_proxima) break;
+    page += 1;
+    if (page > 1000) throw new Error(SANITIZED_FAILURE);
+  }
+  if (expectedTransactions === null || expectedIncome === null || expectedRows === null
+    || coverage.complete !== true || coverage.closed_transactions_included !== closedActivities.length
+    || expectedTransactions !== closedActivities.length || expectedRows !== total
+    || expectedTransactions + expectedIncome !== total || expectedWatermark === null) {
+    throw new Error(SANITIZED_FAILURE);
+  }
+  return { closedActivities, coverage, total, highWatermark: expectedWatermark };
 }
 
 async function changedSinceCheckpoint(
@@ -471,6 +565,10 @@ async function syncCrv(ctx: AddonContext): Promise<AppliedSnapshot> {
   // Holdings are still refreshed if the optional ledger endpoint is temporarily
   // unavailable; the source is then marked stale and the next cycle retries it.
   const ledger = await fetchCrvLedger(ctx);
+  const activities = await fetchCrvActivities(ctx);
+  if (activities.coverage.income_included !== snapshot.income?.length) {
+    throw new Error(SANITIZED_FAILURE);
+  }
   const previousCrvRaw = await ctx.api.storage.get(CRV_RECORDS_KEY);
   let previousCrvCacheId: string | null = null;
   try { previousCrvCacheId = (JSON.parse(previousCrvRaw ?? '{}') as { cacheId?: string }).cacheId ?? null; } catch { previousCrvCacheId = null; }
@@ -482,23 +580,30 @@ async function syncCrv(ctx: AddonContext): Promise<AppliedSnapshot> {
     snapshotId: snapshot.snapshot_id!,
     income: snapshot.income ?? [],
     ledger: ledger.items,
+    closedActivities: activities.closedActivities,
     incomeCoverage: snapshot.coverage?.income ?? {},
     ledgerCoverage: ledger.coverage,
+    activitiesCoverage: activities.coverage,
+    activitiesTotal: activities.total,
     ledgerComplete: ledger.coverage.completeness === 'complete',
   };
   await storeRecordSet(ctx, `${cachePrefix}.income`, crvRecords.income as unknown as SourceRecord[]);
   await storeRecordSet(ctx, `${cachePrefix}.ledger`, crvRecords.ledger);
+  await storeRecordSet(ctx, `${cachePrefix}.closed-activities`, crvRecords.closedActivities);
   await ctx.api.storage.set(CRV_RECORDS_KEY, JSON.stringify({
     cacheId: crvRecords.cacheId,
     syncedAt: crvRecords.syncedAt,
     snapshotId: crvRecords.snapshotId,
     incomeCoverage: crvRecords.incomeCoverage,
     ledgerCoverage: crvRecords.ledgerCoverage,
+    activitiesCoverage: crvRecords.activitiesCoverage,
+    activitiesTotal: crvRecords.activitiesTotal,
     ledgerComplete: crvRecords.ledgerComplete,
   }));
   if (previousCrvCacheId) {
     await deleteRecordSet(ctx, `${CRV_RECORDS_KEY}.${previousCrvCacheId}.income`);
     await deleteRecordSet(ctx, `${CRV_RECORDS_KEY}.${previousCrvCacheId}.ledger`);
+    await deleteRecordSet(ctx, `${CRV_RECORDS_KEY}.${previousCrvCacheId}.closed-activities`);
   }
   const activeSources = new Set(
     [...grouped.keys()].map((key) => sourceAccountId(`crv:${key}`)),
@@ -616,7 +721,7 @@ function ImportPage({ ctx }: { ctx: AddonContext }) {
   const [sourceStatuses, setSourceStatuses] = useState({ cb: emptySourceStatus(), crv: emptySourceStatus() });
   const [cbRecords, setCbRecords] = useState<CachedCbRecords | null>(null);
   const [crvRecords, setCrvRecords] = useState<CachedCrvRecords | null>(null);
-  const [tab, setTab] = useState<'cb' | 'income' | 'ledger'>('cb');
+  const [tab, setTab] = useState<'cb' | 'income' | 'closed' | 'ledger'>('cb');
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
   const refreshSourceStatuses = async () => {
@@ -624,22 +729,23 @@ function ImportPage({ ctx }: { ctx: AddonContext }) {
     const crv = await loadSourceStatus(ctx, CRV_SYNC_STATUS_KEY);
     setSourceStatuses({ cb, crv });
     try {
-      const [cbRaw, crvRaw] = await Promise.all([
+  const [cbRaw, crvRaw] = await Promise.all([
         ctx.api.storage.get(CB_RECORDS_KEY),
         ctx.api.storage.get(CRV_RECORDS_KEY),
       ]);
       const cbMeta = cbRaw ? JSON.parse(cbRaw) as Omit<CachedCbRecords, 'entries' | 'accounts' | 'categories' | 'transfers'> : null;
       const crvMeta = crvRaw ? JSON.parse(crvRaw) as Omit<CachedCrvRecords, 'income' | 'ledger'> : null;
-      const [entries, cbAccounts, categories, transfers, income, ledger] = await Promise.all([
+  const [entries, cbAccounts, categories, transfers, income, ledger, closedActivities] = await Promise.all([
         cbMeta ? loadRecordSet(ctx, `${CB_RECORDS_KEY}.${cbMeta.cacheId}.entries`) : Promise.resolve([]),
         cbMeta ? loadRecordSet(ctx, `${CB_RECORDS_KEY}.${cbMeta.cacheId}.accounts`) : Promise.resolve([]),
         cbMeta ? loadRecordSet(ctx, `${CB_RECORDS_KEY}.${cbMeta.cacheId}.categories`) : Promise.resolve([]),
         cbMeta ? loadRecordSet(ctx, `${CB_RECORDS_KEY}.${cbMeta.cacheId}.transfers`) : Promise.resolve([]),
         crvMeta ? loadRecordSet(ctx, `${CRV_RECORDS_KEY}.${crvMeta.cacheId}.income`) : Promise.resolve([]),
         crvMeta ? loadRecordSet(ctx, `${CRV_RECORDS_KEY}.${crvMeta.cacheId}.ledger`) : Promise.resolve([]),
+        crvMeta ? loadRecordSet(ctx, `${CRV_RECORDS_KEY}.${crvMeta.cacheId}.closed-activities`) : Promise.resolve([]),
       ]);
       setCbRecords(cbMeta ? { ...cbMeta, entries, accounts: cbAccounts, categories, transfers } : null);
-      setCrvRecords(crvMeta ? { ...crvMeta, income: income as unknown as CrvIncome[], ledger } : null);
+      setCrvRecords(crvMeta ? { ...crvMeta, income: income as unknown as CrvIncome[], ledger, closedActivities } : null);
     } catch {
       setStatus('O cache de lançamentos está inválido. Execute a importação completa para reconstruí-lo.');
     }
@@ -698,7 +804,8 @@ function ImportPage({ ctx }: { ctx: AddonContext }) {
       category_name: categories.get(String(entry.category_id ?? '')) ?? 'Categoria não identificada',
       transfer_group: entry.transfer_id ? (transfers.has(String(entry.transfer_id)) ? 'Sim' : 'Não localizado') : '—',
     }))
-    : tab === 'income' ? (crvRecords?.income ?? []) as unknown as SourceRecord[] : (crvRecords?.ledger ?? []);
+    : tab === 'income' ? (crvRecords?.income ?? []) as unknown as SourceRecord[]
+      : tab === 'closed' ? (crvRecords?.closedActivities ?? []) : (crvRecords?.ledger ?? []);
   const filteredRows = rows.filter((row) => search.trim() === '' || Object.values(row).some((value) => String(value ?? '').toLocaleLowerCase('pt-BR').includes(search.trim().toLocaleLowerCase('pt-BR'))));
   const pageCount = Math.max(1, Math.ceil(filteredRows.length / RECORDS_PAGE_SIZE));
   const visibleRows = filteredRows.slice((Math.min(page, pageCount) - 1) * RECORDS_PAGE_SIZE, Math.min(page, pageCount) * RECORDS_PAGE_SIZE);
@@ -706,15 +813,19 @@ function ImportPage({ ctx }: { ctx: AddonContext }) {
     ? ['due_date', 'realized_date', 'description', 'account_name', 'category_name', 'entry_type', 'status', 'planned_amount', 'realized_amount', 'currency', 'operation_type', 'installment', 'installments', 'is_recurring', 'transfer_group']
     : tab === 'income'
       ? ['date', 'instrument', 'kind', 'amount', 'currency', 'account_name', 'role', 'cash_accounting_role']
-      : ['date', 'instrument', 'kind', 'execution_side', 'quantity_delta', 'resulting_quantity', 'price', 'realized_result', 'currency', 'account_name', 'portfolio', 'cash_accounting_role'];
-  const label = (key: string) => ({ due_date: 'Vencimento', realized_date: 'Realizado em', description: 'Descrição', account_name: 'Conta/corretora', category_name: 'Categoria', entry_type: 'Tipo', status: 'Status', planned_amount: 'Previsto', realized_amount: 'Realizado', currency: 'Moeda', operation_type: 'Operação', installment: 'Parcela', installments: 'Parcelas', is_recurring: 'Recorrente', transfer_group: 'Grupo transferência', date: 'Data', instrument: 'Ativo', kind: 'Tipo', amount: 'Valor analítico', role: 'Papel', cash_accounting_role: 'Papel no caixa', execution_side: 'Lado', quantity_delta: 'Variação quantidade', resulting_quantity: 'Quantidade final', price: 'Preço', realized_result: 'Resultado realizado', portfolio: 'Carteira' } as Record<string, string>)[key] ?? key;
+      : tab === 'closed'
+        ? ['data', 'descricao', 'tipo', 'valor_realizado', 'moeda', 'instrumento', 'instituicao']
+        : ['date', 'instrument', 'kind', 'execution_side', 'quantity_delta', 'resulting_quantity', 'price', 'realized_result', 'currency', 'account_name', 'portfolio', 'cash_accounting_role'];
+  const label = (key: string) => ({ due_date: 'Vencimento', realized_date: 'Realizado em', description: 'Descrição', account_name: 'Conta/corretora', category_name: 'Categoria', entry_type: 'Tipo', status: 'Status', planned_amount: 'Previsto', realized_amount: 'Realizado', currency: 'Moeda', operation_type: 'Operação', installment: 'Parcela', installments: 'Parcelas', is_recurring: 'Recorrente', transfer_group: 'Grupo transferência', date: 'Data', instrument: 'Ativo', kind: 'Tipo', amount: 'Valor analítico', role: 'Papel', cash_accounting_role: 'Papel no caixa', execution_side: 'Lado', quantity_delta: 'Variação quantidade', resulting_quantity: 'Quantidade final', price: 'Preço', realized_result: 'Resultado realizado', portfolio: 'Carteira', data: 'Data', descricao: 'Descrição', tipo: 'Tipo', valor_realizado: 'Resultado agregado', moeda: 'Moeda', instrumento: 'Ativo', instituicao: 'Corretora' } as Record<string, string>)[key] ?? key;
   const formatCell = (value: unknown) => value === null || value === undefined || value === '' ? '—' : typeof value === 'boolean' ? (value ? 'Sim' : 'Não') : String(value);
   const recordView = <section className="space-y-3">
     {tab === 'income' && <p className="text-sm text-amber-800">Proventos do CRV são analíticos e podem já constar como caixa no CB. Não são lançados nas atividades do Wealthfolio.</p>}
+    {tab === 'closed' && <p className="text-sm text-amber-800">Resultados agregados de operações encerradas do CRV. A fonte não publica lotes ou preços de execução neste endpoint; esses resultados não viram atividades financeiras no Wealthfolio. O total de {crvRecords?.activitiesTotal ?? 0} atividades inclui também os proventos exibidos na aba ao lado.</p>}
     {tab === 'ledger' && <p className="text-sm text-amber-800">Ledger prospectivo do CRV. Só cobre posições encerradas após 28/09/2026; não há backfill anterior. Os movimentos não são lançamentos de caixa.</p>}
     <div className="flex gap-2 items-center flex-wrap">
       <button className="border rounded p-2" onClick={() => { setTab('cb'); setPage(1); }}>Lançamentos CB ({cbRecords?.entries.length ?? 0})</button>
       <button className="border rounded p-2" onClick={() => { setTab('income'); setPage(1); }}>Proventos CRV ({crvRecords?.income.length ?? 0})</button>
+      <button className="border rounded p-2" onClick={() => { setTab('closed'); setPage(1); }}>Encerramentos CRV ({crvRecords?.closedActivities.length ?? 0})</button>
       <button className="border rounded p-2" onClick={() => { setTab('ledger'); setPage(1); }}>Movimentos CRV ({crvRecords?.ledger.length ?? 0})</button>
       <input aria-label="Buscar registros" placeholder="Buscar" value={search} onChange={(event) => { setSearch(event.target.value); setPage(1); }} className="border rounded p-2" />
     </div>
@@ -732,6 +843,7 @@ function ImportPage({ ctx }: { ctx: AddonContext }) {
     </div>
     {tab === 'cb' && <p className="text-sm">Cobertura declarada pelo CB: {JSON.stringify(cbRecords?.coverage.cash_entry ?? 'aguardando primeira sincronização')} · transferências: {transfers.size}. Categorias de movimentação e grupos de transferência são mostrados para conciliação, sem ajustar saldos.</p>}
     {tab === 'income' && <p className="text-sm">Cobertura declarada pelo CRV: {JSON.stringify(crvRecords?.incomeCoverage ?? 'aguardando primeira sincronização')}.</p>}
+    {tab === 'closed' && <p className="text-sm">Cobertura do endpoint de atividades: {JSON.stringify(crvRecords?.activitiesCoverage ?? 'aguardando primeira sincronização')}.</p>}
     {tab === 'ledger' && <p className="text-sm">Cobertura do endpoint: {JSON.stringify(crvRecords?.ledgerCoverage ?? 'aguardando primeira sincronização')}{!crvRecords?.ledgerComplete && crvRecords && ' · O escopo informado pela fonte é prospectivo.'}</p>}
     <p className="text-xs text-muted-foreground">Última cópia local CB: {cbRecords?.syncedAt ? new Date(cbRecords.syncedAt).toLocaleString('pt-BR') : '—'} · CRV: {crvRecords?.syncedAt ? new Date(crvRecords.syncedAt).toLocaleString('pt-BR') : '—'}</p>
   </section>;

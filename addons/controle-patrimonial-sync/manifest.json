@@ -1,7 +1,7 @@
 {
   "id": "controle-patrimonial-sync",
   "name": "Controle Patrimonial",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Imports read-only CB and CRV v4 snapshots into Wealthfolio.",
   "author": "MSPA",
   "main": "dist/addon.js",

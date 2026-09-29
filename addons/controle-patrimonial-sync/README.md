@@ -4,8 +4,9 @@ Read-only integration for the CB and CRV `patrimonio/v4` endpoints. It creates
 only missing Wealthfolio accounts and replaces same-day `HOLDINGS` snapshots.
 It also keeps a local, searchable source view of every CB cash entry, category,
 account and transfer group, all persisted CRV income records, and every page of
-the CRV position ledger. The source records are shown in the add-on and are not
-converted into Wealthfolio activities or cash balances.
+the CRV position ledger. It also reads CRV's paginated closed-activity summaries
+with the v4 integration token. The source records are shown in the add-on and
+are not converted into Wealthfolio activities or cash balances.
 
 After the tokens are saved, the enabled addon makes one initial import and
 repeats it every 15 minutes while its runtime is active. Concurrent cycles are
@@ -34,6 +35,12 @@ price history is omitted from the add-on request to stay below the local
 network response limit; Wealthfolio continues to use its configured quote
 provider. It requires the custom Wealthfolio image and the exact local targets
 documented in the parent README.
+
+The CRV activities endpoint includes persisted income summaries and result
+summaries for closed transactions. Closed transactions do not include full
+execution lots or individual execution prices, so the source continues to
+declare complete trades unavailable. Income entries already shown in the CRV
+income table are not duplicated in the closed-activity table.
 
 The source tables are rebuilt with the full snapshot after a source change and
 on manual import. CB coverage is reported by the publisher, including its
