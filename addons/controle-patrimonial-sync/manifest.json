@@ -1,7 +1,7 @@
 {
   "id": "controle-patrimonial-sync",
   "name": "Controle Patrimonial",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "description": "Imports read-only CB and CRV v4 snapshots into Wealthfolio.",
   "author": "MSPA",
   "main": "dist/addon.js",
@@ -23,7 +23,7 @@
   "permissions": [
     { "category": "accounts", "functions": ["getAll", "create"], "purpose": "Create and find accounts mapped from CB and CRV." },
     { "category": "snapshots", "functions": ["save"], "purpose": "Replace the current holdings or cash snapshot idempotently." },
-    { "category": "secrets", "functions": ["set"], "purpose": "Keep each source Bearer token outside addon code and storage." },
+    { "category": "secrets", "functions": ["set", "use"], "purpose": "Store each source Bearer token in the secret vault and use it only to authenticate read-only API requests." },
     { "category": "network", "functions": ["request"], "purpose": "Read the explicitly approved local CB and CRV v4 APIs." }
   ],
   "keywords": ["wealthfolio", "controle-bancario", "controle-renda-variavel"],

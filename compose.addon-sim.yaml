@@ -1,0 +1,12 @@
+name: wealthfolio-addon-sim
+
+# Simulação do add-on contra um host Wealthfolio simulado, sem Node.js no host
+# e sem rede: nenhuma escrita em CB, CRV ou Wealthfolio. Rode antes de empacotar.
+services:
+  addon-sim:
+    image: node:24-alpine
+    working_dir: /workspace
+    network_mode: none
+    volumes:
+      - ./addons/controle-patrimonial-sync:/workspace:ro
+    command: ["node", "sim/run.mjs"]

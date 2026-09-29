@@ -467,6 +467,7 @@ async function findOrCreateAccount(
     currency,
     trackingMode: 'HOLDINGS',
     isActive: true,
+    isDefault: false,
     meta: marker,
   }) as { id: string };
 }
