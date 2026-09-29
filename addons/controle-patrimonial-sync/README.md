@@ -1,7 +1,11 @@
 # Controle Patrimonial addon
 
-Importer for the CB and CRV `patrimonio/v4/snapshot` endpoints.
-It creates only missing accounts and replaces same-day `HOLDINGS` snapshots.
+Read-only integration for the CB and CRV `patrimonio/v4` endpoints. It creates
+only missing Wealthfolio accounts and replaces same-day `HOLDINGS` snapshots.
+It also keeps a local, searchable source view of every CB cash entry, category,
+account and transfer group, all persisted CRV income records, and every page of
+the CRV position ledger. The source records are shown in the add-on and are not
+converted into Wealthfolio activities or cash balances.
 
 After the tokens are saved, the enabled addon makes one initial import and
 repeats it every 15 minutes while its runtime is active. Concurrent cycles are
@@ -22,9 +26,21 @@ portfolio absent from a complete source snapshot receives an empty same-day
 snapshot. The addon cannot delete or rename host accounts because those APIs
 are intentionally outside its permissions.
 
+CRV income is explicitly analytic and may already be represented as cash in CB.
 The addon never creates CRV BUY/SELL or DIVIDEND activities, so it does not
-double-count cash already controlled by CB. It requires the custom Wealthfolio
-image and the exact local targets documented in the parent README.
+double-count that cash. The CRV ledger is prospective; the source does not
+provide a historical backfill before its declared coverage revision. CRV market
+price history is omitted from the add-on request to stay below the local
+network response limit; Wealthfolio continues to use its configured quote
+provider. It requires the custom Wealthfolio image and the exact local targets
+documented in the parent README.
+
+The source tables are rebuilt with the full snapshot after a source change and
+on manual import. CB coverage is reported by the publisher, including its
+transfer completeness declaration. CRV ledger pages are read in order until
+the publisher reports no next page. If that endpoint fails, the CRV holdings
+snapshot still refreshes; the CRV source status is marked stale and the next
+scheduled cycle retries the full source refresh.
 
 Run `docker compose -f compose.addon-build.yaml run --rm addon-build` from the
 parent directory to create `release/controle-patrimonial-sync.zip`. Install
