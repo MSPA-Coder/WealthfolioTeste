@@ -1,0 +1,625 @@
+diff --git a/apps/server/README.md b/apps/server/README.md
+index e8777ff86c9df9151b4a695f99decce32926b09a..05fcca78a78b1c7861709ace984accc2b218bf07 100644
+--- a/apps/server/README.md
++++ b/apps/server/README.md
+@@ -17,6 +17,7 @@ Key environment variables
+ - `WF_DB_PATH`: Path to the SQLite database file (or a directory; if a directory is provided, `app.db` is used inside it). Example: `./db/app.db`.
+ - `WF_CORS_ALLOW_ORIGINS`: Comma-separated list of allowed origins for CORS. Example: `http://localhost:1420`.
+ - `WF_REQUEST_TIMEOUT_MS`: Request timeout in milliseconds. Default `300000`.
++- `WF_ADDON_NETWORK_PRIVATE_TARGETS`: Exact local HTTP API roots permitted for read-only addon requests. To enable the server-side CB/CRV v4 bootstrap, include `http://cb-api:8000/patrimonio/v4,http://crv-api:5003/patrimonio/v4` and attach the Wealthfolio server to the network where those aliases resolve. The sync service only calls the fixed `metadata` and `snapshot` GET endpoints.
+ - `WF_STATIC_DIR`: Directory to serve static assets from (the web build output). Default `dist`.
+ - `WF_SECRET_KEY`: 32-byte key (required unless `WF_SECRET_KEY_FILE` is set) used to encrypt secrets at rest and sign JWTs. Must decode to exactly 32 bytes.
+   Can be provided as:
+@@ -63,6 +64,7 @@ Notes
+ - The server also honors `DATABASE_URL`; when running in this workspace, `WF_DB_PATH` is preferred and propagated to `DATABASE_URL` internally so the core layer uses the expected path.
+ - Database migrations are embedded and applied automatically on startup.
+ - Secrets in web/server mode are stored in an encrypted JSON file derived from the database directory using `WF_SECRET_KEY`.
++- The protected `GET /api/v1/patrimonio-sync/status` endpoint returns sanitized source checkpoints. `POST /api/v1/patrimonio-sync/sync` reads the CB and CRV v4 metadata and snapshots using the existing addon-scoped secrets `controle-patrimonial-sync` / `cb.token` and `crv.token`. It imports CB accounts and dated cash balances plus CRV brokerage accounts and holdings through the account and manual snapshot domain services. Stable source-derived IDs and same-day snapshot replacement make retries idempotent. Bank entries and analytic income are not imported.
+ 
+ Existing vault files keep their ownership, permissions, ACLs and link targets.
+ Individual file mounts and writable vaults in non-writable directories remain
+diff --git a/apps/server/src/api.rs b/apps/server/src/api.rs
+index 833d8d9982873b1cb13201e5d44382698f1ff3b8..3138ae5a29c2eec83a6b1776a5b79d435a9bcb9f 100644
+--- a/apps/server/src/api.rs
++++ b/apps/server/src/api.rs
+@@ -52,6 +52,7 @@ mod holdings;
+ mod limits;
+ mod market_data;
+ mod net_worth;
++mod patrimonio_sync;
+ mod performance;
+ pub(crate) mod portable_backups;
+ mod portfolio;
+@@ -183,6 +184,7 @@ fn app_router_with_profiles(
+         .merge(addons::router())
+         .merge(taxonomies::router())
+         .merge(net_worth::router())
++        .merge(patrimonio_sync::router())
+         .merge(alternative_assets::router())
+         .merge(ai_providers::router())
+         .merge(ai_chat::router())
+diff --git a/apps/server/src/api/patrimonio_sync.rs b/apps/server/src/api/patrimonio_sync.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d3167b7c8a5512ac0b5b2ac4f0924a5c8714dfd4
+--- /dev/null
++++ b/apps/server/src/api/patrimonio_sync.rs
+@@ -0,0 +1,566 @@
++//! Server-side, read-only bootstrap for the CB/CRV patrimonio v4 sources.
++//!
++//! Imports only source-backed accounts and holdings snapshots through the
++//! existing domain services. No bank entries or analytic income are synthesized.
++
++use std::sync::Arc;
++
++use axum::{
++    Extension, Json, Router,
++    routing::{get, post},
++};
++use chrono::NaiveDate;
++use rust_decimal::Decimal;
++use serde::{Deserialize, Serialize};
++use serde_json::Value;
++use sha2::{Digest, Sha256};
++use wealthfolio_core::{
++    accounts::{AccountServiceTrait, AccountUpdate, NewAccount, TrackingMode, account_types},
++    addons::network::{
++        AddonNetworkAuth, AddonNetworkRequest, perform_addon_network_request,
++        resolve_addon_network_auth_header,
++    },
++    portfolio::snapshot::{
++        SnapshotSource,
++        manual_snapshot_service::{
++            CashBalanceInput, ManualHoldingInput, ManualSnapshotRequest, ManualSnapshotService,
++        },
++    },
++    settings::SettingsServiceTrait,
++};
++
++use crate::{
++    error::{ApiError, ApiResult},
++    main_lib::AppState,
++};
++
++const ADDON_ID: &str = "controle-patrimonial-sync";
++const CONTRACT: &str = "patrimonio/v4";
++const CB_BASE_URL: &str = "http://cb-api:8000/patrimonio/v4";
++const CRV_BASE_URL: &str = "http://crv-api:5003/patrimonio/v4";
++const CB_CHECKPOINT_KEY: &str = "patrimonio_sync_cb_checkpoint";
++const CRV_CHECKPOINT_KEY: &str = "patrimonio_sync_crv_checkpoint";
++
++static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
++
++#[derive(Clone, Copy)]
++struct Source {
++    id: &'static str,
++    base_url: &'static str,
++    host: &'static str,
++    token_key: &'static str,
++    checkpoint_key: &'static str,
++}
++
++const SOURCES: [Source; 2] = [
++    Source {
++        id: "cb",
++        base_url: CB_BASE_URL,
++        host: "cb-api",
++        token_key: "cb.token",
++        checkpoint_key: CB_CHECKPOINT_KEY,
++    },
++    Source {
++        id: "crv",
++        base_url: CRV_BASE_URL,
++        host: "crv-api",
++        token_key: "crv.token",
++        checkpoint_key: CRV_CHECKPOINT_KEY,
++    },
++];
++
++#[derive(Clone, Debug, Default, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct SourceStatus {
++    source: String,
++    state: String,
++    updated_at: Option<String>,
++    snapshot_id: Option<String>,
++    high_watermark: Option<String>,
++    item_count: Option<usize>,
++    accounts_imported: Option<usize>,
++    snapshots_imported: Option<usize>,
++    error: Option<String>,
++}
++
++#[derive(Serialize)]
++#[serde(rename_all = "camelCase")]
++struct SyncStatus {
++    running: bool,
++    sources: Vec<SourceStatus>,
++}
++
++async fn get_status(Extension(state): Extension<Arc<AppState>>) -> ApiResult<Json<SyncStatus>> {
++    Ok(Json(SyncStatus {
++        running: SYNC_LOCK.try_lock().is_err(),
++        sources: load_statuses(state.settings_service.as_ref()),
++    }))
++}
++
++async fn sync_now(Extension(state): Extension<Arc<AppState>>) -> ApiResult<Json<SyncStatus>> {
++    let Ok(_guard) = SYNC_LOCK.try_lock() else {
++        return Err(ApiError::Forbidden(
++            "A sincronização patrimonial já está em execução.".into(),
++        ));
++    };
++
++    let mut statuses = load_statuses(state.settings_service.as_ref());
++    for source in SOURCES {
++        let index = statuses
++            .iter()
++            .position(|status| status.source == source.id)
++            .unwrap_or_else(|| {
++                statuses.push(SourceStatus {
++                    source: source.id.to_string(),
++                    ..SourceStatus::default()
++                });
++                statuses.len() - 1
++            });
++        statuses[index].state = "running".into();
++        statuses[index].error = None;
++        persist_status(
++            state.settings_service.as_ref(),
++            source.checkpoint_key,
++            &statuses[index],
++        )
++        .await?;
++
++        match fetch_source(&state, source).await {
++            Ok(status) => {
++                statuses[index] = status;
++                persist_status(
++                    state.settings_service.as_ref(),
++                    source.checkpoint_key,
++                    &statuses[index],
++                )
++                .await?;
++            }
++            Err(error) => {
++                statuses[index].state = "failed".into();
++                statuses[index].updated_at = Some(chrono::Utc::now().to_rfc3339());
++                statuses[index].error = Some(error);
++                persist_status(
++                    state.settings_service.as_ref(),
++                    source.checkpoint_key,
++                    &statuses[index],
++                )
++                .await?;
++            }
++        }
++    }
++
++    Ok(Json(SyncStatus {
++        running: false,
++        sources: statuses,
++    }))
++}
++
++async fn fetch_source(state: &AppState, source: Source) -> Result<SourceStatus, String> {
++    let auth = AddonNetworkAuth {
++        auth_type: "bearer".into(),
++        secret_key: source.token_key.into(),
++    };
++    let authorization =
++        resolve_addon_network_auth_header(ADDON_ID, Some(&auth), state.secret_store.as_ref())?;
++    let metadata = request_json(
++        source,
++        format!("{}/metadata", source.base_url),
++        authorization.as_deref(),
++        source.host,
++    )
++    .await?;
++    validate_contract(&metadata)?;
++
++    let snapshot = request_json(
++        source,
++        format!("{}/snapshot", source.base_url),
++        authorization.as_deref(),
++        source.host,
++    )
++    .await?;
++    validate_contract(&snapshot)?;
++
++    let high_watermark = snapshot
++        .get("high_watermark")
++        .and_then(Value::as_str)
++        .filter(|value| !value.is_empty())
++        .ok_or_else(|| "Snapshot v4 inválido: checkpoint ausente.".to_string())?;
++    let snapshot_id = snapshot
++        .get("snapshot_id")
++        .and_then(Value::as_str)
++        .map(str::to_string);
++    let (item_count, accounts_imported, snapshots_imported) = match source.id {
++        "cb" => sync_cb_accounts(state, &snapshot).await?,
++        "crv" => sync_crv_holdings(state, &snapshot).await?,
++        _ => return Err("Fonte de sincronização não suportada.".into()),
++    };
++
++    Ok(SourceStatus {
++        source: source.id.into(),
++        state: "ready".into(),
++        updated_at: Some(chrono::Utc::now().to_rfc3339()),
++        snapshot_id,
++        high_watermark: Some(high_watermark.to_string()),
++        item_count: Some(item_count),
++        accounts_imported: Some(accounts_imported),
++        snapshots_imported: Some(snapshots_imported),
++        error: None,
++    })
++}
++
++async fn sync_cb_accounts(
++    state: &AppState,
++    snapshot: &Value,
++) -> Result<(usize, usize, usize), String> {
++    let items = snapshot
++        .get("items")
++        .and_then(Value::as_array)
++        .ok_or_else(|| "Snapshot CB v4 inválido: lista de itens ausente.".to_string())?;
++    let base_currency = state.base_currency.read().unwrap().clone();
++    let mut accounts_synced = 0;
++    let mut snapshots_saved = 0;
++    for item in items {
++        if item.get("resource").and_then(Value::as_str) != Some("account") {
++            continue;
++        }
++        let payload = item
++            .get("payload")
++            .ok_or_else(|| "Conta CB v4 inválida: dados ausentes.".to_string())?;
++        let source_id = required_string(payload, "source_id", "ID da conta CB")?;
++        let name = required_string(payload, "name", "nome da conta CB")?;
++        let currency = required_string(payload, "currency", "moeda da conta CB")?;
++        let account_kind = payload.get("account_type").and_then(Value::as_str);
++        // The first management phase imports cash only. Credit cards and
++        // applications use different operational semantics in CB.
++        if matches!(account_kind, Some("cartao_credito" | "aplicacao")) {
++            continue;
++        }
++        let account_id = stable_id("pcb", source_id);
++        ensure_source_account(
++            state,
++            &account_id,
++            source_id,
++            name,
++            &currency,
++            "PATRIMONIO_CB",
++            account_types::CASH,
++            TrackingMode::NotSet,
++        )
++        .await?;
++        accounts_synced += 1;
++
++        let balance = payload.get("balance").and_then(Value::as_str);
++        let balance_date = payload
++            .get("balance_as_of")
++            .and_then(Value::as_str)
++            .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
++        if let (Some(balance), Some(snapshot_date)) = (balance, balance_date) {
++            save_source_snapshot(
++                state,
++                &account_id,
++                snapshot_date,
++                Vec::new(),
++                vec![CashBalanceInput {
++                    currency: currency.to_string(),
++                    amount: parse_decimal(balance, "saldo CB")?,
++                }],
++                &base_currency,
++            )
++            .await?;
++            snapshots_saved += 1;
++        } else if balance_date.is_none() && balance.is_some() {
++            return Err("Conta CB v4 inválida: data do saldo ausente.".into());
++        }
++    }
++
++    Ok((items.len(), accounts_synced, snapshots_saved))
++}
++
++async fn sync_crv_holdings(
++    state: &AppState,
++    snapshot: &Value,
++) -> Result<(usize, usize, usize), String> {
++    let accounts = snapshot.get("accounts").and_then(Value::as_array)
++        .ok_or_else(|| "Snapshot CRV v4 inválido: contas ausentes.".to_string())?;
++    let holdings = snapshot.get("holdings").and_then(Value::as_array)
++        .ok_or_else(|| "Snapshot CRV v4 inválido: posições ausentes.".to_string())?;
++    let base_currency = state.base_currency.read().unwrap().clone();
++    let snapshot_date = snapshot.get("data_de_referencia").and_then(Value::as_str)
++        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
++        .ok_or_else(|| "Snapshot CRV v4 inválido: data de referência ausente.".to_string())?;
++
++    let mut account_catalog = std::collections::BTreeMap::new();
++    for account in accounts {
++        let external_id = required_string(account, "id", "chave da conta CRV")?;
++        let source_id = required_string(account, "source_id", "ID da conta CRV")?;
++        let name = required_string(account, "name", "nome da conta CRV")?;
++        account_catalog.insert(external_id.to_string(), (source_id.to_string(), name.to_string()));
++    }
++
++    // CRV declares this pilot as real, open equities only. Accounts that only
++    // appear in analytic income are intentionally not materialized here.
++    let mut account_ids: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
++    let mut positions_by_account: std::collections::BTreeMap<String, Vec<ManualHoldingInput>> = std::collections::BTreeMap::new();
++    for holding in holdings {
++        if holding.get("instrument_type").and_then(Value::as_str) != Some("equity") {
++            return Err("Snapshot CRV v4 contém instrumento fora do escopo de ações.".into());
++        }
++        let external_account_id = required_string(holding, "account", "conta da posição CRV")?;
++        let account_id = if let Some(account_id) = account_ids.get(external_account_id) {
++            account_id.clone()
++        } else {
++            let (source_id, name) = account_catalog.get(external_account_id).cloned()
++                .ok_or_else(|| "Snapshot CRV v4 inválido: posição sem conta correspondente.".to_string())?;
++            let account_id = stable_id("prv", &source_id);
++            ensure_source_account(state, &account_id, &source_id, &name, &base_currency,
++                "PATRIMONIO_CRV", account_types::SECURITIES, TrackingMode::Holdings).await?;
++            account_ids.insert(external_account_id.to_string(), account_id.clone());
++            account_id
++        };
++        let symbol = required_string(holding, "instrument", "instrumento CRV")?;
++        let currency = required_string(holding, "currency", "moeda da posição CRV")?;
++        let instrument_key = format!("{}:{}:{}", holding.get("market").and_then(Value::as_str).unwrap_or_default(), symbol, currency);
++        let quantity = parse_decimal_field(holding, "quantity", "quantidade CRV")?;
++        let average_cost = parse_decimal_field(holding, "average_cost", "custo médio CRV")?;
++        positions_by_account.entry(account_id).or_default().push(ManualHoldingInput {
++            asset_id: Some(stable_id("crv-asset", &instrument_key)),
++            symbol: symbol.to_string(),
++            exchange_mic: holding.get("market").and_then(Value::as_str).map(str::to_string),
++            quantity, currency: currency.to_string(), average_cost, name: None,
++            data_source: None, asset_kind: None, quote_ccy: Some(currency.to_string()),
++            instrument_type: Some("EQUITY".into()), provider_id: None, provider_symbol: None,
++        });
++    }
++
++    let accounts_synced = account_ids.len();
++    let mut snapshots_saved = 0;
++    for account_id in account_ids.values() {
++        let positions = positions_by_account.remove(account_id).unwrap_or_default();
++        save_source_snapshot(state, account_id, snapshot_date, positions, Vec::new(), &base_currency).await?;
++        snapshots_saved += 1;
++    }
++    Ok((holdings.len(), accounts_synced, snapshots_saved))
++}
++async fn ensure_source_account(
++    state: &AppState,
++    id: &str,
++    source_id: &str,
++    name: &str,
++    currency: &str,
++    provider: &str,
++    account_type: &str,
++    tracking_mode: TrackingMode,
++) -> Result<(), String> {
++    let meta = serde_json::json!({ "sourceId": source_id, "sourceSystem": provider }).to_string();
++    let existing = state
++        .account_service
++        .get_all_accounts()
++        .map_err(|_| "Não foi possível consultar as contas locais.".to_string())?
++        .into_iter()
++        .find(|account| account.id == id);
++
++    if let Some(existing) = existing {
++        if existing.provider.as_deref() != Some(provider)
++            || existing.provider_account_id.as_deref() != Some(source_id)
++        {
++            return Err("O identificador de uma conta importada já está em uso.".into());
++        }
++        state
++            .account_service
++            .update_account(AccountUpdate {
++                id: Some(id.to_string()),
++                name: name.to_string(),
++                account_type: account_type.to_string(),
++                group: existing.group,
++                is_default: false,
++                is_active: true,
++                is_archived: Some(false),
++                tracking_mode: Some(tracking_mode),
++                platform_id: existing.platform_id,
++                account_number: existing.account_number,
++                meta: Some(meta),
++                provider: Some(provider.to_string()),
++                provider_account_id: Some(source_id.to_string()),
++            })
++            .await
++            .map_err(|_| "Não foi possível atualizar a conta importada.".to_string())?;
++    } else {
++        state
++            .account_service
++            .create_account(NewAccount {
++                id: Some(id.to_string()),
++                name: name.to_string(),
++                account_type: account_type.to_string(),
++                group: None,
++                currency: currency.to_string(),
++                is_default: false,
++                is_active: true,
++                platform_id: None,
++                account_number: None,
++                meta: Some(meta),
++                provider: Some(provider.to_string()),
++                provider_account_id: Some(source_id.to_string()),
++                is_archived: false,
++                tracking_mode,
++            })
++            .await
++            .map_err(|_| "Não foi possível criar a conta importada.".to_string())?;
++    }
++    Ok(())
++}
++
++async fn save_source_snapshot(
++    state: &AppState,
++    account_id: &str,
++    snapshot_date: NaiveDate,
++    positions: Vec<ManualHoldingInput>,
++    cash_balances: Vec<CashBalanceInput>,
++    base_currency: &str,
++) -> Result<(), String> {
++    let account = state
++        .account_service
++        .get_account(account_id)
++        .map_err(|_| "A conta local da sincronização não foi encontrada.".to_string())?;
++    let timezone = state.timezone.read().unwrap().clone();
++    ManualSnapshotService::new(
++        state.asset_service.clone(),
++        state.fx_service.clone(),
++        state.snapshot_service.clone(),
++        state.quote_service.clone(),
++    )
++    .with_timezone(timezone)
++    .save_manual_snapshot(ManualSnapshotRequest {
++        account_id: account_id.to_string(),
++        account_currency: account.currency,
++        snapshot_date,
++        positions,
++        cash_balances,
++        base_currency: Some(base_currency.to_string()),
++        source: SnapshotSource::BrokerImported,
++    })
++    .await
++    .map_err(|_| "Não foi possível gravar o snapshot local.".to_string())?;
++    Ok(())
++}
++
++fn stable_id(prefix: &str, source_id: &str) -> String {
++    let digest = Sha256::digest(source_id.as_bytes());
++    let encoded = digest
++        .iter()
++        .map(|byte| format!("{byte:02x}"))
++        .collect::<String>();
++    format!("{prefix}-{encoded}")
++}
++
++fn required_string<'a>(value: &'a Value, key: &str, label: &str) -> Result<&'a str, String> {
++    value
++        .get(key)
++        .and_then(Value::as_str)
++        .filter(|value| !value.trim().is_empty())
++        .ok_or_else(|| format!("Snapshot v4 inválido: {label} ausente."))
++}
++
++fn parse_decimal_field(value: &Value, key: &str, label: &str) -> Result<Decimal, String> {
++    let text = required_string(value, key, label)?;
++    parse_decimal(text, label)
++}
++
++fn parse_decimal(value: &str, label: &str) -> Result<Decimal, String> {
++    value
++        .parse::<Decimal>()
++        .map_err(|_| format!("Snapshot v4 inválido: {label} inválido."))
++}
++
++async fn request_json(
++    source: Source,
++    url: String,
++    authorization: Option<&str>,
++    host: &str,
++) -> Result<Value, String> {
++    let request = AddonNetworkRequest {
++        url,
++        method: Some("GET".into()),
++        headers: None,
++        body: None,
++        auth: None,
++        timeout_secs: Some(20),
++        injected_authorization: authorization.map(str::to_string),
++    };
++    let response = perform_addon_network_request(ADDON_ID, &[host.to_string()], request)
++        .await
++        .map_err(|_| format!("Fonte {} indisponível ou fora da allowlist.", source.id))?;
++    if !(200..300).contains(&response.status) {
++        return Err(format!(
++            "Fonte {} retornou HTTP {}.",
++            source.id, response.status
++        ));
++    }
++    serde_json::from_str(&response.body)
++        .map_err(|_| format!("Fonte {} retornou JSON inválido.", source.id))
++}
++
++fn validate_contract(value: &Value) -> Result<(), String> {
++    if value.get("contrato").and_then(Value::as_str) != Some(CONTRACT) {
++        return Err("A fonte não publicou o contrato patrimonio/v4.".into());
++    }
++    Ok(())
++}
++
++fn load_statuses(settings: &dyn SettingsServiceTrait) -> Vec<SourceStatus> {
++    SOURCES
++        .iter()
++        .map(|source| {
++            settings
++                .get_setting_value(source.checkpoint_key)
++                .ok()
++                .flatten()
++                .and_then(|value| serde_json::from_str(&value).ok())
++                .unwrap_or_else(|| SourceStatus {
++                    source: source.id.into(),
++                    state: "not_started".into(),
++                    ..SourceStatus::default()
++                })
++        })
++        .collect()
++}
++
++async fn persist_status(
++    settings: &dyn SettingsServiceTrait,
++    key: &str,
++    status: &SourceStatus,
++) -> ApiResult<()> {
++    let serialized = serde_json::to_string(status)
++        .map_err(|_| ApiError::Internal("Falha ao salvar checkpoint de sincronização.".into()))?;
++    settings
++        .set_setting_value(key, &serialized)
++        .await
++        .map_err(|_| ApiError::Internal("Falha ao salvar checkpoint de sincronização.".into()))
++}
++
++pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
++    Router::new()
++        .route("/patrimonio-sync/status", get(get_status))
++        .route("/patrimonio-sync/sync", post(sync_now))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn validates_v4_contract() {
++        assert!(validate_contract(&serde_json::json!({"contrato": "patrimonio/v4"})).is_ok());
++        assert!(validate_contract(&serde_json::json!({"contrato": "patrimonio/v3"})).is_err());
++    }
++
++    #[test]
++    fn source_urls_use_the_internal_aliases_and_v4_path() {
++        assert_eq!(CB_BASE_URL, "http://cb-api:8000/patrimonio/v4");
++        assert_eq!(CRV_BASE_URL, "http://crv-api:5003/patrimonio/v4");
++        assert!(
++            SOURCES
++                .iter()
++                .all(|source| source.base_url.ends_with("/patrimonio/v4"))
++        );
++    }
++}
+diff --git a/compose.yml b/compose.yml
+index acb68292e3af5d3654044e3f6fbf7b15d3e25e5f..69f160b400be54413f2cbeef8200bfa1ef6de2fd 100644
+--- a/compose.yml
++++ b/compose.yml
+@@ -25,6 +25,8 @@ services:
+       # Startup requirement; convert existing databases offline before enabling.
+       WF_DB_REQUIRE_ENCRYPTION: "${WF_DB_REQUIRE_ENCRYPTION:-0}"
+       # Optional exact local read-only addon API targets; unset keeps private hosts blocked.
++      # CB/CRV sync uses these two exact v4 roots on the shared internal Docker network:
++      # http://cb-api:8000/patrimonio/v4,http://crv-api:5003/patrimonio/v4
+       WF_ADDON_NETWORK_PRIVATE_TARGETS: "${WF_ADDON_NETWORK_PRIVATE_TARGETS:-}"
+ 
+       # ── Authentication ────────────────────────────────────────────────

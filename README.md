@@ -78,3 +78,7 @@ then calls their APIs over Docker DNS and does not need a public HTTPS route
 for this machine-to-machine traffic. The connector attempts these aliases after
 the Docker Desktop local targets. The browser-facing services continue behind
 the HTTPS reverse proxy.
+
+## Patch de integração patrimonial
+
+O código do Wealthfolio é mantido a partir da versão upstream 3.9.1. Antes de criar a imagem, execute `scripts/apply-upstream-patches.sh` contra o checkout indicado; o script é idempotente e aplica `patches/0001-patrimonio-server-sync.patch`. O patch implementa a sincronização protegida de snapshots CB/CRV v4 usando somente a rede Docker interna e os segredos cifrados do add-on.
