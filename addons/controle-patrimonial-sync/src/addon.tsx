@@ -18,7 +18,11 @@ const CB_CHECKPOINT_KEY = 'checkpoint.cb';
 const CRV_CHECKPOINT_KEY = 'checkpoint.crv';
 const CB_SYNC_STATUS_KEY = 'sync.status.cb';
 const CRV_SYNC_STATUS_KEY = 'sync.status.crv';
+const CB_RECORDS_KEY = 'records.cb.v1';
+const CRV_RECORDS_KEY = 'records.crv.v1';
 const STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
+const RECORDS_PAGE_SIZE = 50;
+const STORAGE_CHUNK_LIMIT_BYTES = 180_000;
 const SANITIZED_FAILURE = 'Falha ao sincronizar esta fonte. Verifique a disponibilidade e tente novamente.';
 
 let activeSync: Promise<void> | undefined;
@@ -52,14 +56,62 @@ interface SnapshotEnvelope {
   generated_at?: string;
   high_watermark?: string | null;
   accounts?: CbAccount[];
-  items?: Array<{ resource: string; payload: CbAccount }>;
+  items?: Array<{ resource: string; source_id?: string; payload: Record<string, unknown> }>;
   holdings?: CrvHolding[];
+  income?: CrvIncome[];
   data_de_referencia?: string;
   snapshot_as_of?: string;
   coverage?: {
     account?: { state?: string };
+    cash_entry?: Record<string, unknown>;
     holdings?: { complete?: boolean };
+    income?: { included?: number; scope?: string; role?: string; do_not_rebook_as_cash?: boolean };
   };
+}
+
+type SourceRecord = Record<string, unknown>;
+
+interface CrvIncome {
+  source_id: string;
+  date: string;
+  instrument: string;
+  kind: string;
+  currency: string;
+  amount: string;
+  role: 'analytic_only';
+  cash_accounting_role: 'not_a_cash_entry';
+  duplicate_risk: string;
+  account_name: string;
+}
+
+interface CachedCbRecords {
+  cacheId: string;
+  syncedAt: string;
+  snapshotId: string;
+  entries: SourceRecord[];
+  accounts: SourceRecord[];
+  categories: SourceRecord[];
+  transfers: SourceRecord[];
+  coverage: Record<string, unknown>;
+}
+
+interface CachedCrvRecords {
+  cacheId: string;
+  syncedAt: string;
+  snapshotId: string;
+  income: CrvIncome[];
+  ledger: SourceRecord[];
+  incomeCoverage: Record<string, unknown>;
+  ledgerCoverage: Record<string, unknown>;
+  ledgerComplete: boolean;
+}
+
+interface LedgerEnvelope {
+  contrato?: string;
+  sistema?: string;
+  coverage?: Record<string, unknown>;
+  paginacao?: { pagina?: number; tem_proxima?: boolean; total?: number };
+  itens?: SourceRecord[];
 }
 
 interface NetworkResponse {
@@ -127,6 +179,61 @@ async function storeSourceStatus(ctx: AddonContext, storageKey: string, status: 
   await ctx.api.storage.set(storageKey, JSON.stringify(status));
 }
 
+async function storeRecordSet(ctx: AddonContext, prefix: string, records: SourceRecord[]) {
+  const metaKey = `${prefix}.meta`;
+  const chunks: SourceRecord[][] = [];
+  let current: SourceRecord[] = [];
+  for (const record of records) {
+    const candidate = [...current, record];
+    const bytes = new TextEncoder().encode(JSON.stringify(candidate)).length;
+    if (bytes > STORAGE_CHUNK_LIMIT_BYTES && current.length > 0) {
+      chunks.push(current);
+      current = [record];
+    } else {
+      current = candidate;
+    }
+    if (new TextEncoder().encode(JSON.stringify(current)).length > STORAGE_CHUNK_LIMIT_BYTES) {
+      throw new Error(SANITIZED_FAILURE);
+    }
+  }
+  if (current.length) chunks.push(current);
+  for (let index = 0; index < chunks.length; index += 1) {
+    await ctx.api.storage.set(`${prefix}.${index}`, JSON.stringify(chunks[index]));
+  }
+  // Publish the new chunk count only after every chunk is safely written.
+  await ctx.api.storage.set(metaKey, JSON.stringify({ chunks: chunks.length }));
+}
+
+async function deleteRecordSet(ctx: AddonContext, prefix: string) {
+  const raw = await ctx.api.storage.get(`${prefix}.meta`);
+  if (!raw) return;
+  const count = Number((JSON.parse(raw) as { chunks?: number }).chunks ?? 0);
+  if (!Number.isInteger(count) || count < 0 || count > 1000) return;
+  for (let index = 0; index < count; index += 1) await ctx.api.storage.delete(`${prefix}.${index}`);
+  await ctx.api.storage.delete(`${prefix}.meta`);
+}
+
+async function loadRecordSet(ctx: AddonContext, prefix: string): Promise<SourceRecord[]> {
+  const raw = await ctx.api.storage.get(`${prefix}.meta`);
+  if (!raw) return [];
+  let count: number;
+  try {
+    count = Number((JSON.parse(raw) as { chunks?: number }).chunks ?? 0);
+  } catch {
+    throw new Error(SANITIZED_FAILURE);
+  }
+  if (!Number.isInteger(count) || count < 0 || count > 1000) throw new Error(SANITIZED_FAILURE);
+  const records: SourceRecord[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const chunk = await ctx.api.storage.get(`${prefix}.${index}`);
+    if (!chunk) throw new Error(SANITIZED_FAILURE);
+    const parsed = JSON.parse(chunk) as unknown;
+    if (!Array.isArray(parsed)) throw new Error(SANITIZED_FAILURE);
+    records.push(...parsed as SourceRecord[]);
+  }
+  return records;
+}
+
 function sourceAccountId(source: string) {
   return `${ACCOUNT_META_KEY}:${source}`;
 }
@@ -160,7 +267,8 @@ async function fetchSnapshot(
   secretKey: string,
   system: 'controle-bancario' | 'controle-renda-variavel',
 ): Promise<SnapshotEnvelope> {
-  const response = await requestFromSource(ctx, baseUrls, '/snapshot', secretKey);
+  const suffix = system === 'controle-renda-variavel' ? '/snapshot?include_prices=false' : '/snapshot';
+  const response = await requestFromSource(ctx, baseUrls, suffix, secretKey);
   if (response.status !== 200) throw new Error(SANITIZED_FAILURE);
   let snapshot: SnapshotEnvelope;
   try {
@@ -187,6 +295,32 @@ async function fetchSnapshot(
     throw new Error(SANITIZED_FAILURE);
   }
   return snapshot;
+}
+
+async function fetchCrvLedger(ctx: AddonContext): Promise<{ items: SourceRecord[]; coverage: Record<string, unknown> }> {
+  const items: SourceRecord[] = [];
+  let coverage: Record<string, unknown> = {};
+  let page = 1;
+  while (true) {
+    const response = await requestFromSource(ctx, CRV_BASE_URLS, `/ledger?page=${page}&page_size=100`, CRV_TOKEN_KEY);
+    if (response.status !== 200) throw new Error(SANITIZED_FAILURE);
+    let body: LedgerEnvelope;
+    try {
+      body = JSON.parse(response.body) as LedgerEnvelope;
+    } catch {
+      throw new Error(SANITIZED_FAILURE);
+    }
+    if (body.contrato !== 'patrimonio/v4' || body.sistema !== 'controle-renda-variavel'
+      || !Array.isArray(body.itens) || body.paginacao?.pagina !== page) {
+      throw new Error(SANITIZED_FAILURE);
+    }
+    coverage = body.coverage ?? {};
+    items.push(...body.itens);
+    if (!body.paginacao.tem_proxima) break;
+    page += 1;
+    if (page > 1000) throw new Error(SANITIZED_FAILURE);
+  }
+  return { items, coverage };
 }
 
 async function changedSinceCheckpoint(
@@ -253,6 +387,36 @@ async function syncCb(ctx: AddonContext): Promise<AppliedSnapshot> {
     const target = await findOrCreateAccount(ctx, account.source_id, `CB · ${account.name}`, account.currency, 'CASH');
     await ctx.api.snapshots.save(target.id, [], { [account.currency]: account.balance }, date);
   }
+  const previousCbRaw = await ctx.api.storage.get(CB_RECORDS_KEY);
+  let previousCbCacheId: string | null = null;
+  try { previousCbCacheId = (JSON.parse(previousCbRaw ?? '{}') as { cacheId?: string }).cacheId ?? null; } catch { previousCbCacheId = null; }
+  const cacheId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const cachePrefix = `${CB_RECORDS_KEY}.${cacheId}`;
+  const cbRecords = {
+    cacheId,
+    syncedAt: new Date().toISOString(),
+    snapshotId: snapshot.snapshot_id!,
+    entries: (snapshot.items ?? []).filter((item) => item.resource === 'cash_entry').map((item) => ({ source_id: item.source_id, ...item.payload })),
+    accounts: (snapshot.items ?? []).filter((item) => item.resource === 'account').map((item) => ({ source_id: item.source_id, ...item.payload })),
+    categories: (snapshot.items ?? []).filter((item) => item.resource === 'category').map((item) => ({ source_id: item.source_id, ...item.payload })),
+    transfers: (snapshot.items ?? []).filter((item) => item.resource === 'transfer').map((item) => ({ source_id: item.source_id, ...item.payload })),
+    coverage: snapshot.coverage ?? {},
+  };
+  await storeRecordSet(ctx, `${cachePrefix}.entries`, cbRecords.entries);
+  await storeRecordSet(ctx, `${cachePrefix}.accounts`, cbRecords.accounts);
+  await storeRecordSet(ctx, `${cachePrefix}.categories`, cbRecords.categories);
+  await storeRecordSet(ctx, `${cachePrefix}.transfers`, cbRecords.transfers);
+  await ctx.api.storage.set(CB_RECORDS_KEY, JSON.stringify({
+    cacheId: cbRecords.cacheId,
+    syncedAt: cbRecords.syncedAt,
+    snapshotId: cbRecords.snapshotId,
+    coverage: cbRecords.coverage,
+  }));
+  if (previousCbCacheId) {
+    for (const name of ['entries', 'accounts', 'categories', 'transfers']) {
+      await deleteRecordSet(ctx, `${CB_RECORDS_KEY}.${previousCbCacheId}.${name}`);
+    }
+  }
   // A missing resource is not a zero balance. Only a source that explicitly
   // declares the account collection complete may clear a prior local snapshot.
   if (snapshot.coverage?.account?.state === 'complete') {
@@ -300,6 +464,38 @@ async function syncCrv(ctx: AddonContext): Promise<AppliedSnapshot> {
     }));
     await ctx.api.snapshots.save(target.id, positions, {}, date);
   }
+  // Holdings are still refreshed if the optional ledger endpoint is temporarily
+  // unavailable; the source is then marked stale and the next cycle retries it.
+  const ledger = await fetchCrvLedger(ctx);
+  const previousCrvRaw = await ctx.api.storage.get(CRV_RECORDS_KEY);
+  let previousCrvCacheId: string | null = null;
+  try { previousCrvCacheId = (JSON.parse(previousCrvRaw ?? '{}') as { cacheId?: string }).cacheId ?? null; } catch { previousCrvCacheId = null; }
+  const cacheId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const cachePrefix = `${CRV_RECORDS_KEY}.${cacheId}`;
+  const crvRecords = {
+    cacheId,
+    syncedAt: new Date().toISOString(),
+    snapshotId: snapshot.snapshot_id!,
+    income: snapshot.income ?? [],
+    ledger: ledger.items,
+    incomeCoverage: snapshot.coverage?.income ?? {},
+    ledgerCoverage: ledger.coverage,
+    ledgerComplete: ledger.coverage.completeness === 'complete',
+  };
+  await storeRecordSet(ctx, `${cachePrefix}.income`, crvRecords.income as unknown as SourceRecord[]);
+  await storeRecordSet(ctx, `${cachePrefix}.ledger`, crvRecords.ledger);
+  await ctx.api.storage.set(CRV_RECORDS_KEY, JSON.stringify({
+    cacheId: crvRecords.cacheId,
+    syncedAt: crvRecords.syncedAt,
+    snapshotId: crvRecords.snapshotId,
+    incomeCoverage: crvRecords.incomeCoverage,
+    ledgerCoverage: crvRecords.ledgerCoverage,
+    ledgerComplete: crvRecords.ledgerComplete,
+  }));
+  if (previousCrvCacheId) {
+    await deleteRecordSet(ctx, `${CRV_RECORDS_KEY}.${previousCrvCacheId}.income`);
+    await deleteRecordSet(ctx, `${CRV_RECORDS_KEY}.${previousCrvCacheId}.ledger`);
+  }
   const activeSources = new Set(
     [...grouped.keys()].map((key) => sourceAccountId(`crv:${key}`)),
   );
@@ -341,10 +537,13 @@ async function syncAll(ctx: AddonContext, force = false) {
       });
       try {
         const changed = await changedSinceCheckpoint(ctx, baseUrls, tokenKey, checkpointKey);
+        const cacheKey = storageKey === CB_SYNC_STATUS_KEY ? CB_RECORDS_KEY : CRV_RECORDS_KEY;
+        const cacheMissing = !(await ctx.api.storage.get(cacheKey));
         // A status record can be lost independently of its checkpoint. Without
         // a successful local snapshot, rebuild the local view before trusting
-        // an empty incremental response. Snapshot-only sources also arrive here.
-        if (force || changed || !previous.lastSuccessAt) {
+        // an empty incremental response. Snapshot-only sources and addon updates
+        // that introduce a new source cache also arrive here.
+        if (force || changed || !previous.lastSuccessAt || cacheMissing) {
           const applied = await applySnapshot();
           if (applied.highWatermark !== null) {
             await ctx.api.storage.set(checkpointKey, applied.highWatermark);
@@ -411,10 +610,35 @@ function ImportPage({ ctx }: { ctx: AddonContext }) {
   const [crvToken, setCrvToken] = useState('');
   const [status, setStatus] = useState('Configure os tokens e importe manualmente.');
   const [sourceStatuses, setSourceStatuses] = useState({ cb: emptySourceStatus(), crv: emptySourceStatus() });
+  const [cbRecords, setCbRecords] = useState<CachedCbRecords | null>(null);
+  const [crvRecords, setCrvRecords] = useState<CachedCrvRecords | null>(null);
+  const [tab, setTab] = useState<'cb' | 'income' | 'ledger'>('cb');
+  const [search, setSearch] = useState('');
+  const [page, setPage] = useState(1);
   const refreshSourceStatuses = async () => {
     const cb = await loadSourceStatus(ctx, CB_SYNC_STATUS_KEY);
     const crv = await loadSourceStatus(ctx, CRV_SYNC_STATUS_KEY);
     setSourceStatuses({ cb, crv });
+    try {
+      const [cbRaw, crvRaw] = await Promise.all([
+        ctx.api.storage.get(CB_RECORDS_KEY),
+        ctx.api.storage.get(CRV_RECORDS_KEY),
+      ]);
+      const cbMeta = cbRaw ? JSON.parse(cbRaw) as Omit<CachedCbRecords, 'entries' | 'accounts' | 'categories' | 'transfers'> : null;
+      const crvMeta = crvRaw ? JSON.parse(crvRaw) as Omit<CachedCrvRecords, 'income' | 'ledger'> : null;
+      const [entries, cbAccounts, categories, transfers, income, ledger] = await Promise.all([
+        cbMeta ? loadRecordSet(ctx, `${CB_RECORDS_KEY}.${cbMeta.cacheId}.entries`) : Promise.resolve([]),
+        cbMeta ? loadRecordSet(ctx, `${CB_RECORDS_KEY}.${cbMeta.cacheId}.accounts`) : Promise.resolve([]),
+        cbMeta ? loadRecordSet(ctx, `${CB_RECORDS_KEY}.${cbMeta.cacheId}.categories`) : Promise.resolve([]),
+        cbMeta ? loadRecordSet(ctx, `${CB_RECORDS_KEY}.${cbMeta.cacheId}.transfers`) : Promise.resolve([]),
+        crvMeta ? loadRecordSet(ctx, `${CRV_RECORDS_KEY}.${crvMeta.cacheId}.income`) : Promise.resolve([]),
+        crvMeta ? loadRecordSet(ctx, `${CRV_RECORDS_KEY}.${crvMeta.cacheId}.ledger`) : Promise.resolve([]),
+      ]);
+      setCbRecords(cbMeta ? { ...cbMeta, entries, accounts: cbAccounts, categories, transfers } : null);
+      setCrvRecords(crvMeta ? { ...crvMeta, income: income as unknown as CrvIncome[], ledger } : null);
+    } catch {
+      setStatus('O cache de lançamentos está inválido. Execute a importação completa para reconstruí-lo.');
+    }
   };
   useEffect(() => {
     void refreshSourceStatuses();
@@ -460,9 +684,56 @@ function ImportPage({ ctx }: { ctx: AddonContext }) {
       {source.failure && <p className="text-sm text-red-700">{source.failure}</p>}
     </section>;
   };
-  return <main className="p-6 max-w-2xl space-y-4">
+  const categories = new Map((cbRecords?.categories ?? []).map((item) => [String(item.source_id ?? ''), String(item.name ?? '—')]));
+  const accounts = new Map((cbRecords?.accounts ?? []).map((item) => [String(item.source_id ?? ''), String(item.name ?? '—')]));
+  const transfers = new Map((cbRecords?.transfers ?? []).map((item) => [String(item.source_id ?? item.transfer_id ?? ''), item]));
+  const rows: SourceRecord[] = tab === 'cb'
+    ? (cbRecords?.entries ?? []).map((entry) => ({
+      ...entry,
+      account_name: accounts.get(String(entry.account_id ?? '')) ?? 'Conta não identificada',
+      category_name: categories.get(String(entry.category_id ?? '')) ?? 'Categoria não identificada',
+      transfer_group: entry.transfer_id ? (transfers.has(String(entry.transfer_id)) ? 'Sim' : 'Não localizado') : '—',
+    }))
+    : tab === 'income' ? (crvRecords?.income ?? []) as unknown as SourceRecord[] : (crvRecords?.ledger ?? []);
+  const filteredRows = rows.filter((row) => search.trim() === '' || Object.values(row).some((value) => String(value ?? '').toLocaleLowerCase('pt-BR').includes(search.trim().toLocaleLowerCase('pt-BR'))));
+  const pageCount = Math.max(1, Math.ceil(filteredRows.length / RECORDS_PAGE_SIZE));
+  const visibleRows = filteredRows.slice((Math.min(page, pageCount) - 1) * RECORDS_PAGE_SIZE, Math.min(page, pageCount) * RECORDS_PAGE_SIZE);
+  const columns = tab === 'cb'
+    ? ['due_date', 'realized_date', 'description', 'account_name', 'category_name', 'entry_type', 'status', 'planned_amount', 'realized_amount', 'currency', 'operation_type', 'installment', 'installments', 'is_recurring', 'transfer_group']
+    : tab === 'income'
+      ? ['date', 'instrument', 'kind', 'amount', 'currency', 'account_name', 'role', 'cash_accounting_role']
+      : ['date', 'instrument', 'kind', 'execution_side', 'quantity_delta', 'resulting_quantity', 'price', 'realized_result', 'currency', 'account_name', 'portfolio', 'cash_accounting_role'];
+  const label = (key: string) => ({ due_date: 'Vencimento', realized_date: 'Realizado em', description: 'Descrição', account_name: 'Conta/corretora', category_name: 'Categoria', entry_type: 'Tipo', status: 'Status', planned_amount: 'Previsto', realized_amount: 'Realizado', currency: 'Moeda', operation_type: 'Operação', installment: 'Parcela', installments: 'Parcelas', is_recurring: 'Recorrente', transfer_group: 'Grupo transferência', date: 'Data', instrument: 'Ativo', kind: 'Tipo', amount: 'Valor analítico', role: 'Papel', cash_accounting_role: 'Papel no caixa', execution_side: 'Lado', quantity_delta: 'Variação quantidade', resulting_quantity: 'Quantidade final', price: 'Preço', realized_result: 'Resultado realizado', portfolio: 'Carteira' } as Record<string, string>)[key] ?? key;
+  const formatCell = (value: unknown) => value === null || value === undefined || value === '' ? '—' : typeof value === 'boolean' ? (value ? 'Sim' : 'Não') : String(value);
+  const recordView = <section className="space-y-3">
+    {tab === 'income' && <p className="text-sm text-amber-800">Proventos do CRV são analíticos e podem já constar como caixa no CB. Não são lançados nas atividades do Wealthfolio.</p>}
+    {tab === 'ledger' && <p className="text-sm text-amber-800">Ledger prospectivo do CRV. Só cobre posições encerradas após 28/09/2026; não há backfill anterior. Os movimentos não são lançamentos de caixa.</p>}
+    <div className="flex gap-2 items-center flex-wrap">
+      <button className="border rounded p-2" onClick={() => { setTab('cb'); setPage(1); }}>Lançamentos CB ({cbRecords?.entries.length ?? 0})</button>
+      <button className="border rounded p-2" onClick={() => { setTab('income'); setPage(1); }}>Proventos CRV ({crvRecords?.income.length ?? 0})</button>
+      <button className="border rounded p-2" onClick={() => { setTab('ledger'); setPage(1); }}>Movimentos CRV ({crvRecords?.ledger.length ?? 0})</button>
+      <input aria-label="Buscar registros" placeholder="Buscar" value={search} onChange={(event) => { setSearch(event.target.value); setPage(1); }} className="border rounded p-2" />
+    </div>
+    <p className="text-sm">Exibindo {filteredRows.length} registro(s) · página {Math.min(page, pageCount)} de {pageCount}. Valores e estados são os publicados pela fonte.</p>
+    <div className="overflow-auto border rounded">
+      <table className="text-sm min-w-full">
+        <thead><tr>{columns.map((column) => <th key={column} className="text-left p-2 border-b whitespace-nowrap">{label(column)}</th>)}</tr></thead>
+        <tbody>{visibleRows.map((row, index) => <tr key={String(row.source_id ?? row.id ?? index)} className="border-b">{columns.map((column) => <td key={column} className="p-2 whitespace-nowrap">{formatCell(row[column])}</td>)}</tr>)}</tbody>
+      </table>
+      {!visibleRows.length && <p className="p-3 text-sm">Nenhum registro nesta consulta.</p>}
+    </div>
+    <div className="flex gap-2">
+      <button disabled={page <= 1} className="border rounded p-2 disabled:opacity-50" onClick={() => setPage((value) => Math.max(1, value - 1))}>Anterior</button>
+      <button disabled={page >= pageCount} className="border rounded p-2 disabled:opacity-50" onClick={() => setPage((value) => Math.min(pageCount, value + 1))}>Próxima</button>
+    </div>
+    {tab === 'cb' && <p className="text-sm">Cobertura declarada pelo CB: {JSON.stringify(cbRecords?.coverage.cash_entry ?? 'aguardando primeira sincronização')} · transferências: {transfers.size}. Categorias de movimentação e grupos de transferência são mostrados para conciliação, sem ajustar saldos.</p>}
+    {tab === 'income' && <p className="text-sm">Cobertura declarada pelo CRV: {JSON.stringify(crvRecords?.incomeCoverage ?? 'aguardando primeira sincronização')}.</p>}
+    {tab === 'ledger' && <p className="text-sm">Cobertura do endpoint: {JSON.stringify(crvRecords?.ledgerCoverage ?? 'aguardando primeira sincronização')}{!crvRecords?.ledgerComplete && crvRecords && ' · O escopo informado pela fonte é prospectivo.'}</p>}
+    <p className="text-xs text-muted-foreground">Última cópia local CB: {cbRecords?.syncedAt ? new Date(cbRecords.syncedAt).toLocaleString('pt-BR') : '—'} · CRV: {crvRecords?.syncedAt ? new Date(crvRecords.syncedAt).toLocaleString('pt-BR') : '—'}</p>
+  </section>;
+  return <main className="p-6 max-w-none space-y-4">
     <h1 className="text-2xl font-semibold">Controle Patrimonial</h1>
-    <p>Fase 2: importa caixa CB e holdings CRV em contas separadas. Não cria compras, vendas ou proventos.</p>
+    <p>Snapshots patrimoniais e registros de origem em modo somente leitura. Lançamentos CB ficam visíveis para análise; proventos e movimentos CRV não são convertidos em caixa ou atividades.</p>
     <label className="block">Token CB<input value={cbToken} onChange={(e) => setCbToken(e.target.value)} type="password" className="block border rounded p-2 w-full" /></label>
     <label className="block">Token CRV<input value={crvToken} onChange={(e) => setCrvToken(e.target.value)} type="password" className="block border rounded p-2 w-full" /></label>
     <button onClick={saveTokens} className="border rounded p-2">Guardar tokens</button>{' '}
@@ -472,6 +743,7 @@ function ImportPage({ ctx }: { ctx: AddonContext }) {
       {renderSourceStatus('CB', sourceStatuses.cb)}
       {renderSourceStatus('CRV', sourceStatuses.crv)}
     </div>
+    {recordView}
   </main>;
 }
 
