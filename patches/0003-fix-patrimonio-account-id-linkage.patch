@@ -1,1 +1,111 @@
-From 9c5955b70b3b8ba1b3fb81aba5d41bb4a28285b6 Mon Sep 17 00:00:00 2001From: MSPA <mspa.coder@outlook.com>Date: Tue, 29 Sep 2026 06:40:27 -0300Subject: [PATCH] Fix patrimonio snapshots for generated account IDs--- apps/server/src/api/patrimonio_sync.rs | 34 ++++++++++++-------------- 1 file changed, 15 insertions(+), 19 deletions(-)diff --git a/apps/server/src/api/patrimonio_sync.rs b/apps/server/src/api/patrimonio_sync.rsindex e95dfb3..e1fc47c 100644--- a/apps/server/src/api/patrimonio_sync.rs+++ b/apps/server/src/api/patrimonio_sync.rs@@ -235,16 +235,14 @@ async fn sync_cb_accounts(         if matches!(account_kind, Some("cartao_credito" | "aplicacao")) {             continue;         }-        let account_id = stable_id("pcb", source_id);-        ensure_source_account(+        let account_id = ensure_source_account(             state,-            &account_id,             source_id,             name,             &currency,             "PATRIMONIO_CB",             account_types::CASH,-            TrackingMode::NotSet,+            TrackingMode::Holdings,         )         .await?;         accounts_synced += 1;@@ -312,8 +310,7 @@ async fn sync_crv_holdings(         } else {             let (source_id, name) = account_catalog.get(external_account_id).cloned()                 .ok_or_else(|| "Snapshot CRV v4 inválido: posição sem conta correspondente.".to_string())?;-            let account_id = stable_id("prv", &source_id);-            ensure_source_account(state, &account_id, &source_id, &name, &base_currency,+            let account_id = ensure_source_account(state, &source_id, &name, &base_currency,                 "PATRIMONIO_CRV", account_types::SECURITIES, TrackingMode::Holdings).await?;             account_ids.insert(external_account_id.to_string(), account_id.clone());             account_id@@ -344,32 +341,30 @@ async fn sync_crv_holdings( } async fn ensure_source_account(     state: &AppState,-    id: &str,     source_id: &str,     name: &str,     currency: &str,     provider: &str,     account_type: &str,     tracking_mode: TrackingMode,-) -> Result<(), String> {+) -> Result<String, String> {     let meta = serde_json::json!({ "sourceId": source_id, "sourceSystem": provider }).to_string();     let existing = state         .account_service         .get_all_accounts()         .map_err(|_| "Não foi possível consultar as contas locais.".to_string())?         .into_iter()-        .find(|account| account.id == id);+        .find(|account| {+            account.provider.as_deref() == Some(provider)+                && account.provider_account_id.as_deref() == Some(source_id)+        });      if let Some(existing) = existing {-        if existing.provider.as_deref() != Some(provider)-            || existing.provider_account_id.as_deref() != Some(source_id)-        {-            return Err("O identificador de uma conta importada já está em uso.".into());-        }-        state+        let id = existing.id.clone();+        let updated = state             .account_service             .update_account(AccountUpdate {-                id: Some(id.to_string()),+                id: Some(id),                 name: name.to_string(),                 account_type: account_type.to_string(),                 group: existing.group,@@ -385,11 +380,12 @@ async fn ensure_source_account(             })             .await             .map_err(|_| "Não foi possível atualizar a conta importada.".to_string())?;+        Ok(updated.id)     } else {-        state+        let created = state             .account_service             .create_account(NewAccount {-                id: Some(id.to_string()),+                id: Some(stable_id("patrimonio", &format!("{provider}:{source_id}"))),                 name: name.to_string(),                 account_type: account_type.to_string(),                 group: None,@@ -406,8 +402,8 @@ async fn ensure_source_account(             })             .await             .map_err(|_| "Não foi possível criar a conta importada.".to_string())?;+        Ok(created.id)     }-    Ok(()) }  async fn save_source_snapshot(-- 2.55.0.windows.5
+From 9c5955b70b3b8ba1b3fb81aba5d41bb4a28285b6 Mon Sep 17 00:00:00 2001
+From: MSPA <mspa.coder@outlook.com>
+Date: Tue, 29 Sep 2026 06:40:27 -0300
+Subject: [PATCH] Fix patrimonio snapshots for generated account IDs
+
+---
+ apps/server/src/api/patrimonio_sync.rs | 34 ++++++++++++--------------
+ 1 file changed, 15 insertions(+), 19 deletions(-)
+
+diff --git a/apps/server/src/api/patrimonio_sync.rs b/apps/server/src/api/patrimonio_sync.rs
+index e95dfb3..e1fc47c 100644
+--- a/apps/server/src/api/patrimonio_sync.rs
++++ b/apps/server/src/api/patrimonio_sync.rs
+@@ -235,16 +235,14 @@ async fn sync_cb_accounts(
+         if matches!(account_kind, Some("cartao_credito" | "aplicacao")) {
+             continue;
+         }
+-        let account_id = stable_id("pcb", source_id);
+-        ensure_source_account(
++        let account_id = ensure_source_account(
+             state,
+-            &account_id,
+             source_id,
+             name,
+             &currency,
+             "PATRIMONIO_CB",
+             account_types::CASH,
+-            TrackingMode::NotSet,
++            TrackingMode::Holdings,
+         )
+         .await?;
+         accounts_synced += 1;
+@@ -312,8 +310,7 @@ async fn sync_crv_holdings(
+         } else {
+             let (source_id, name) = account_catalog.get(external_account_id).cloned()
+                 .ok_or_else(|| "Snapshot CRV v4 inválido: posição sem conta correspondente.".to_string())?;
+-            let account_id = stable_id("prv", &source_id);
+-            ensure_source_account(state, &account_id, &source_id, &name, &base_currency,
++            let account_id = ensure_source_account(state, &source_id, &name, &base_currency,
+                 "PATRIMONIO_CRV", account_types::SECURITIES, TrackingMode::Holdings).await?;
+             account_ids.insert(external_account_id.to_string(), account_id.clone());
+             account_id
+@@ -344,32 +341,30 @@ async fn sync_crv_holdings(
+ }
+ async fn ensure_source_account(
+     state: &AppState,
+-    id: &str,
+     source_id: &str,
+     name: &str,
+     currency: &str,
+     provider: &str,
+     account_type: &str,
+     tracking_mode: TrackingMode,
+-) -> Result<(), String> {
++) -> Result<String, String> {
+     let meta = serde_json::json!({ "sourceId": source_id, "sourceSystem": provider }).to_string();
+     let existing = state
+         .account_service
+         .get_all_accounts()
+         .map_err(|_| "Não foi possível consultar as contas locais.".to_string())?
+         .into_iter()
+-        .find(|account| account.id == id);
++        .find(|account| {
++            account.provider.as_deref() == Some(provider)
++                && account.provider_account_id.as_deref() == Some(source_id)
++        });
+ 
+     if let Some(existing) = existing {
+-        if existing.provider.as_deref() != Some(provider)
+-            || existing.provider_account_id.as_deref() != Some(source_id)
+-        {
+-            return Err("O identificador de uma conta importada já está em uso.".into());
+-        }
+-        state
++        let id = existing.id.clone();
++        let updated = state
+             .account_service
+             .update_account(AccountUpdate {
+-                id: Some(id.to_string()),
++                id: Some(id),
+                 name: name.to_string(),
+                 account_type: account_type.to_string(),
+                 group: existing.group,
+@@ -385,11 +380,12 @@ async fn ensure_source_account(
+             })
+             .await
+             .map_err(|_| "Não foi possível atualizar a conta importada.".to_string())?;
++        Ok(updated.id)
+     } else {
+-        state
++        let created = state
+             .account_service
+             .create_account(NewAccount {
+-                id: Some(id.to_string()),
++                id: Some(stable_id("patrimonio", &format!("{provider}:{source_id}"))),
+                 name: name.to_string(),
+                 account_type: account_type.to_string(),
+                 group: None,
+@@ -406,8 +402,8 @@ async fn ensure_source_account(
+             })
+             .await
+             .map_err(|_| "Não foi possível criar a conta importada.".to_string())?;
++        Ok(created.id)
+     }
+-    Ok(())
+ }
+ 
+ async fn save_source_snapshot(
+-- 
+2.55.0.windows.5
+
