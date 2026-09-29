@@ -53,6 +53,25 @@ feed is unchanged. This deployment is a single Wealthfolio instance: device
 sync must remain disabled because addon storage can be replicated between
 devices.
 
+## Addon simulation (run before packaging)
+
+Nothing is packaged, installed or imported until the simulation passes. It runs
+the real `src/addon.tsx` against an in-memory Wealthfolio host whose validation
+rules are ported from the Wealthfolio 3.9.1 source (account schema, snapshot
+handler, network broker limits, storage limits and permission guards), with no
+network and no writes to CB, CRV or Wealthfolio:
+
+```powershell
+docker compose -f compose.addon-sim.yaml run --rm addon-sim
+```
+
+With `-e SIM_REAL=1` and the real API envelopes piped to stdin
+(`docker run -i --network none -e SIM_REAL=1 ...`) the same checks run against
+real responses, kept in memory only; the report contains counts, never values.
+`sim/verify-package.mjs` checks the built ZIP and runs its `dist/addon.js`.
+After installing a new add-on version, reload the Wealthfolio page before
+clicking **Importar agora**; the previous runtime stays loaded until then.
+
 ## Addon package
 
 Build the installable ZIP without Node.js on the host:
