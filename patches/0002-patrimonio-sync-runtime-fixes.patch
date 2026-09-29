@@ -1,0 +1,59 @@
+diff --git a/apps/server/src/api/patrimonio_sync.rs b/apps/server/src/api/patrimonio_sync.rs
+index d3167b7c8a5512ac0b5b2ac4f0924a5c8714dfd4..e95dfb30986ed1c3d329e1a01cf9d0ae35e02fa0 100644
+--- a/apps/server/src/api/patrimonio_sync.rs
++++ b/apps/server/src/api/patrimonio_sync.rs
+@@ -258,6 +258,7 @@ async fn sync_cb_accounts(
+             save_source_snapshot(
+                 state,
+                 &account_id,
++                &currency,
+                 snapshot_date,
+                 Vec::new(),
+                 vec![CashBalanceInput {
+@@ -336,7 +337,7 @@ async fn sync_crv_holdings(
+     let mut snapshots_saved = 0;
+     for account_id in account_ids.values() {
+         let positions = positions_by_account.remove(account_id).unwrap_or_default();
+-        save_source_snapshot(state, account_id, snapshot_date, positions, Vec::new(), &base_currency).await?;
++        save_source_snapshot(state, account_id, &base_currency, snapshot_date, positions, Vec::new(), &base_currency).await?;
+         snapshots_saved += 1;
+     }
+     Ok((holdings.len(), accounts_synced, snapshots_saved))
+@@ -412,15 +413,12 @@ async fn ensure_source_account(
+ async fn save_source_snapshot(
+     state: &AppState,
+     account_id: &str,
++    account_currency: &str,
+     snapshot_date: NaiveDate,
+     positions: Vec<ManualHoldingInput>,
+     cash_balances: Vec<CashBalanceInput>,
+     base_currency: &str,
+ ) -> Result<(), String> {
+-    let account = state
+-        .account_service
+-        .get_account(account_id)
+-        .map_err(|_| "A conta local da sincronização não foi encontrada.".to_string())?;
+     let timezone = state.timezone.read().unwrap().clone();
+     ManualSnapshotService::new(
+         state.asset_service.clone(),
+@@ -431,7 +429,7 @@ async fn save_source_snapshot(
+     .with_timezone(timezone)
+     .save_manual_snapshot(ManualSnapshotRequest {
+         account_id: account_id.to_string(),
+-        account_currency: account.currency,
++        account_currency: account_currency.to_string(),
+         snapshot_date,
+         positions,
+         cash_balances,
+@@ -480,7 +478,10 @@ async fn request_json(
+     let request = AddonNetworkRequest {
+         url,
+         method: Some("GET".into()),
+-        headers: None,
++        headers: Some(std::collections::BTreeMap::from([(
++            "X-Forwarded-Proto".to_string(),
++            "https".to_string(),
++        )])),
+         body: None,
+         auth: None,
+         timeout_secs: Some(20),
