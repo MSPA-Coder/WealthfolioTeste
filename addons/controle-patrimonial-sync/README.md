@@ -42,6 +42,10 @@ the publisher reports no next page. If that endpoint fails, the CRV holdings
 snapshot still refreshes; the CRV source status is marked stale and the next
 scheduled cycle retries the full source refresh.
 
+Requests use the private Docker HTTP aliases and send
+`X-Forwarded-Proto: https`, matching CB's HTTPS-enforcement middleware and the
+server-side synchronizer. The public apps remain behind their HTTPS proxy.
+
 Run `docker compose -f compose.addon-build.yaml run --rm addon-build` from the
 parent directory to create `release/controle-patrimonial-sync.zip`. Install
 that ZIP from Wealthfolio Settings > Addons and approve only the literal hosts

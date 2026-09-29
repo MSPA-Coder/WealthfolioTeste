@@ -250,6 +250,10 @@ async function requestFromSource(
       return await ctx.api.network.request({
         url: `${baseUrl}${suffix}`,
         method: 'GET',
+        // CB enforces HTTPS at the application layer. This private Docker
+        // hop remains HTTP, while the trusted-proxy signal matches the
+        // server-side sync client used by the same installation.
+        headers: { 'X-Forwarded-Proto': 'https' },
         auth: { type: 'bearer', secretKey },
       }) as NetworkResponse;
     } catch (error) {
