@@ -1,2 +1,5 @@
 .env
 addons/controle-patrimonial-sync/node_modules/
+
+# Artefatos transitórios do build do add-on (o ZIP de release é versionado).
+addons/*/dist/
