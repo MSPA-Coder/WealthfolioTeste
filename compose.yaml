@@ -6,6 +6,13 @@ services:
     build:
       context: ../CodexTemp/wealthfolio-v3.9.1
     restart: unless-stopped
+    # Backup diário no VPS (`manutencao/vps/backup-db.sh`): o diretório deste
+    # caminho, DENTRO do contêiner, é copiado com o contêiner pausado por
+    # segundos, e o BackupRestore leva a cópia para fora do servidor. É o
+    # SQLite cifrado, o `-wal` e o cofre de segredos; sem o rótulo, nada disso
+    # entra no backup. A cópia só abre com a chave mestra.
+    labels:
+      mspa.backup.volume: /data
     ports:
       - "127.0.0.1:18088:8088"
     volumes:

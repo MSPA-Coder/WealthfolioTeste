@@ -101,3 +101,19 @@ the HTTPS reverse proxy.
 ## Patch de integração patrimonial
 
 O código do Wealthfolio é mantido a partir da versão upstream 3.9.1. Antes de criar a imagem, execute `scripts/apply-upstream-patches.sh` contra o checkout indicado; o script é idempotente e aplica `patches/0001-patrimonio-server-sync.patch`. O patch implementa a sincronização protegida de snapshots CB/CRV v4 usando somente a rede Docker interna e os segredos cifrados do add-on.
+
+## Backup
+
+No VPS, o rótulo `mspa.backup.volume: /data` do `compose.yaml` coloca o volume
+`wealthfolio-teste-data` no backup diário (`manutencao/vps/backup-db.sh`): o
+diretório é copiado em `.tar.gz` com o contêiner pausado por segundos, porque
+o SQLite em modo WAL copiado com a aplicação escrevendo pode sair inconsistente
+sem dar erro. O BackupRestore busca a cópia e a guarda fora do servidor, em
+`projects\wealthfolio_teste_vps\volume\`.
+
+A cópia leva o banco cifrado, o `-wal` e o cofre de segredos (os tokens do
+add-on para o CB e o CRV), e **só abre com a chave mestra**: guarde o arquivo
+de `WF_SECRET_KEY_HOST_PATH` e o `.env` no cofre de recuperação, como pede o
+`KIT_RECUPERACAO.md` do BackupRestore. O procedimento de volta está no
+`RESTAURAR.md` de lá. Se o diretório de dados mudar, mude o rótulo junto: sem
+ele, nada daqui entra no backup.
