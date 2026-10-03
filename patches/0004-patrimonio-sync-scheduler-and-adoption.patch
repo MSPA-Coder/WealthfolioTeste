@@ -1,0 +1,1233 @@
+Importação do patrimônio pelo servidor: agendada, com um só mapeamento.
+
+Até aqui o servidor sabia importar o CB e o CRV (patches 0001 a 0003), mas nada o
+disparava, e o add-on importava pelo navegador com regras diferentes. Cada um
+criava as contas à sua maneira, e o painel de produção ficou com 46 contas (cada
+conta do CB duas vezes, e as do CRV em BRL no servidor contra USD no add-on), com
+o patrimônio dobrado.
+
+- Mapeamento único, o do add-on: conta do CB "CB · nome" (só caixa; cartão,
+  aplicação e saldo ausente não viram conta), conta do CRV por (conta, carteira,
+  moeda) "CRV · conta · carteira" na moeda da posição, mesmas posições.
+- Adoção: a conta é achada pelo marcador `meta` que o add-on grava
+  (`controlePatrimonial:...`), depois pela identidade de provedor. Conta
+  arquivada é invisível: arquivar uma cópia é como o operador a aposenta, e o
+  worker nunca a desarquiva. Conta nova ganha um id de outra família, porque os
+  antigos podem pertencer a contas arquivadas.
+- Conta que saiu da fonte recebe um snapshot zerado, só se a fonte declarou a
+  coleção completa. A cobertura do CB (contas, lançamentos e categorias) e a do
+  CRV é conferida antes de aplicar qualquer coisa.
+- Agendador opt-in (WF_PATRIMONIO_SYNC_INTERVAL_SECS, mínimo 60 s, 0 desliga),
+  com o feed `changes` como atalho: sem mudança desde o checkpoint e já importado
+  hoje, só consulta o feed. O dia novo sempre importa, porque o saldo publicado é
+  "de hoje". Token não configurado é o estado `not_configured`, não falha.
+- O perfil precisa abrir na partida: o runtime de cada perfil (e os workers que
+  moram nele) só abria numa requisição ou com token do Connect, então depois de
+  cada reinício o agendador esperaria alguém abrir a tela. Com o agendador
+  ligado, start_connected_profiles abre todos os perfis.
+- O estado de cada fonte também é gravado no storage do add-on
+  (`server.status.cb|crv`), onde a tela de estado dele lê.
+
+Testado nativamente: 12 testes unitários e um teste ponta a ponta com o binário
+real, um banco novo e CB/CRV falsos (adoção, arquivadas intactas, repetição sem
+duplicar, agendador sem nenhuma requisição, atalho do feed, conta que sai).
+
+diff --git a/apps/server/src/api.rs b/apps/server/src/api.rs
+index 3138ae5..7f081a9 100644
+--- a/apps/server/src/api.rs
++++ b/apps/server/src/api.rs
+@@ -52,7 +52,7 @@ mod holdings;
+ mod limits;
+ mod market_data;
+ mod net_worth;
+-mod patrimonio_sync;
++pub(crate) mod patrimonio_sync;
+ mod performance;
+ pub(crate) mod portable_backups;
+ mod portfolio;
+diff --git a/apps/server/src/api/patrimonio_sync.rs b/apps/server/src/api/patrimonio_sync.rs
+index e1fc47c..c4cf8a6 100644
+--- a/apps/server/src/api/patrimonio_sync.rs
++++ b/apps/server/src/api/patrimonio_sync.rs
+@@ -1,13 +1,25 @@
+-//! Server-side, read-only bootstrap for the CB/CRV patrimonio v4 sources.
++//! Server-side, read-only import of the CB/CRV patrimonio v4 sources.
+ //!
+-//! Imports only source-backed accounts and holdings snapshots through the
+-//! existing domain services. No bank entries or analytic income are synthesized.
++//! This is the only place that maps the sources into Wealthfolio accounts and
++//! holdings snapshots. It imports cash balances from the CB and open equity
++//! holdings from the CRV through the existing domain services; no bank entries
++//! or analytic income are synthesized. A periodic worker runs it without anyone
++//! having the browser open, so the daily snapshot never depends on a tab.
++//!
++//! Account identity matches what the `controle-patrimonial-sync` add-on used
++//! before (same `meta` marker, same names), so the accounts it created are
++//! adopted instead of duplicated. Archived accounts are never touched: archiving
++//! a duplicate is how an operator retires it.
+ 
+-use std::sync::Arc;
++use std::{
++    collections::{BTreeMap, BTreeSet},
++    sync::Arc,
++    time::Duration,
++};
+ 
+ use axum::{
+-    Extension, Json, Router,
+     routing::{get, post},
++    Extension, Json, Router,
+ };
+ use chrono::NaiveDate;
+ use rust_decimal::Decimal;
+@@ -15,18 +27,21 @@ use serde::{Deserialize, Serialize};
+ use serde_json::Value;
+ use sha2::{Digest, Sha256};
+ use wealthfolio_core::{
+-    accounts::{AccountServiceTrait, AccountUpdate, NewAccount, TrackingMode, account_types},
++    accounts::{
++        account_types, Account, AccountServiceTrait, AccountUpdate, NewAccount, TrackingMode,
++    },
+     addons::network::{
+-        AddonNetworkAuth, AddonNetworkRequest, perform_addon_network_request,
+-        resolve_addon_network_auth_header,
++        perform_addon_network_request, resolve_addon_network_auth_header, AddonNetworkAuth,
++        AddonNetworkRequest,
+     },
+     portfolio::snapshot::{
+-        SnapshotSource,
+         manual_snapshot_service::{
+             CashBalanceInput, ManualHoldingInput, ManualSnapshotRequest, ManualSnapshotService,
+         },
++        SnapshotSource,
+     },
+     settings::SettingsServiceTrait,
++    utils::time_utils::{parse_user_timezone_or_default, user_today},
+ };
+ 
+ use crate::{
+@@ -41,6 +56,22 @@ const CRV_BASE_URL: &str = "http://crv-api:5003/patrimonio/v4";
+ const CB_CHECKPOINT_KEY: &str = "patrimonio_sync_cb_checkpoint";
+ const CRV_CHECKPOINT_KEY: &str = "patrimonio_sync_crv_checkpoint";
+ 
++/// The `meta` marker the add-on writes on every account it creates
++/// (`ACCOUNT_META_KEY` in its source). Keeping it is what makes adoption work.
++const MARKER_PREFIX: &str = "controlePatrimonial";
++const CB_PROVIDER: &str = "PATRIMONIO_CB";
++const CRV_PROVIDER: &str = "PATRIMONIO_CRV";
++const CB_ACCOUNT_PREFIX: &str = "controle-bancario:account:";
++const CRV_ACCOUNT_PREFIX: &str = "crv:";
++const DATA_SOURCE: &str = "controle-renda-variavel";
++
++/// Seconds between scheduled runs. Unset or 0 keeps the worker off.
++const INTERVAL_ENV: &str = "WF_PATRIMONIO_SYNC_INTERVAL_SECS";
++const MIN_INTERVAL_SECS: u64 = 60;
++const INITIAL_DELAY_SECS: u64 = 60;
++/// The add-on reads these keys to show the server's state.
++const STATUS_STORAGE_PREFIX: &str = "server.status.";
++
+ static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+ 
+ #[derive(Clone, Copy)]
+@@ -81,6 +112,9 @@ struct SourceStatus {
+     accounts_imported: Option<usize>,
+     snapshots_imported: Option<usize>,
+     error: Option<String>,
++    /// Day (user timezone) of the last full import. The balance a source
++    /// publishes is "as of today", so a new day always needs a new snapshot.
++    applied_on: Option<String>,
+ }
+ 
+ #[derive(Serialize)]
+@@ -98,12 +132,26 @@ async fn get_status(Extension(state): Extension<Arc<AppState>>) -> ApiResult<Jso
+ }
+ 
+ async fn sync_now(Extension(state): Extension<Arc<AppState>>) -> ApiResult<Json<SyncStatus>> {
+-    let Ok(_guard) = SYNC_LOCK.try_lock() else {
+-        return Err(ApiError::Forbidden(
++    match run_sync(&state, true).await {
++        Some(result) => Ok(Json(SyncStatus {
++            running: false,
++            sources: result?,
++        })),
++        None => Err(ApiError::Forbidden(
+             "A sincronização patrimonial já está em execução.".into(),
+-        ));
++        )),
++    }
++}
++
++/// Runs every source once. `None` means another run holds the lock.
++async fn run_sync(state: &AppState, force: bool) -> Option<ApiResult<Vec<SourceStatus>>> {
++    let Ok(_guard) = SYNC_LOCK.try_lock() else {
++        return None;
+     };
++    Some(run_sources(state, force).await)
++}
+ 
++async fn run_sources(state: &AppState, force: bool) -> ApiResult<Vec<SourceStatus>> {
+     let mut statuses = load_statuses(state.settings_service.as_ref());
+     for source in SOURCES {
+         let index = statuses
+@@ -116,66 +164,81 @@ async fn sync_now(Extension(state): Extension<Arc<AppState>>) -> ApiResult<Json<
+                 });
+                 statuses.len() - 1
+             });
++        let previous = statuses[index].clone();
+         statuses[index].state = "running".into();
+         statuses[index].error = None;
+-        persist_status(
+-            state.settings_service.as_ref(),
+-            source.checkpoint_key,
+-            &statuses[index],
+-        )
+-        .await?;
++        persist_status(state, &source, &statuses[index]).await?;
+ 
+-        match fetch_source(&state, source).await {
+-            Ok(status) => {
+-                statuses[index] = status;
+-                persist_status(
+-                    state.settings_service.as_ref(),
+-                    source.checkpoint_key,
+-                    &statuses[index],
+-                )
+-                .await?;
+-            }
+-            Err(error) => {
+-                statuses[index].state = "failed".into();
+-                statuses[index].updated_at = Some(chrono::Utc::now().to_rfc3339());
+-                statuses[index].error = Some(error);
+-                persist_status(
+-                    state.settings_service.as_ref(),
+-                    source.checkpoint_key,
+-                    &statuses[index],
+-                )
+-                .await?;
+-            }
+-        }
++        statuses[index] = match sync_source(state, source, &previous, force).await {
++            Ok(status) => status,
++            Err(error) => SourceStatus {
++                state: failure_state(&error).into(),
++                updated_at: Some(chrono::Utc::now().to_rfc3339()),
++                error: Some(error),
++                ..previous
++            },
++        };
++        persist_status(state, &source, &statuses[index]).await?;
+     }
++    Ok(statuses)
++}
+ 
+-    Ok(Json(SyncStatus {
+-        running: false,
+-        sources: statuses,
+-    }))
++/// A source whose token was never configured is not a failure to alarm about:
++/// the operator simply has not finished the setup.
++fn failure_state(error: &str) -> &'static str {
++    if error.contains("secret was not found") {
++        "not_configured"
++    } else {
++        "failed"
++    }
+ }
+ 
+-async fn fetch_source(state: &AppState, source: Source) -> Result<SourceStatus, String> {
++async fn sync_source(
++    state: &AppState,
++    source: Source,
++    previous: &SourceStatus,
++    force: bool,
++) -> Result<SourceStatus, String> {
+     let auth = AddonNetworkAuth {
+         auth_type: "bearer".into(),
+         secret_key: source.token_key.into(),
+     };
+     let authorization =
+         resolve_addon_network_auth_header(ADDON_ID, Some(&auth), state.secret_store.as_ref())?;
+-    let metadata = request_json(
++    let today = today_in_user_timezone(state);
++
++    // Most runs find nothing new: ask the change feed before pulling a whole
++    // snapshot. A day that has not been imported yet is always imported, because
++    // the balance is "as of today".
++    if needs_change_check(previous, &today, force) {
++        let changed = changed_since(
++            source,
++            authorization.as_deref(),
++            previous.high_watermark.as_deref(),
++        )
++        .await?;
++        if changed == Some(false) {
++            return Ok(SourceStatus {
++                updated_at: Some(chrono::Utc::now().to_rfc3339()),
++                error: None,
++                state: "ready".into(),
++                ..previous.clone()
++            });
++        }
++    }
++
++    let (_, metadata) = request_json(
+         source,
+         format!("{}/metadata", source.base_url),
+         authorization.as_deref(),
+-        source.host,
+     )
+     .await?;
+     validate_contract(&metadata)?;
+ 
+-    let snapshot = request_json(
++    let (_, snapshot) = request_json(
+         source,
+         format!("{}/snapshot", source.base_url),
+         authorization.as_deref(),
+-        source.host,
+     )
+     .await?;
+     validate_contract(&snapshot)?;
+@@ -190,8 +253,8 @@ async fn fetch_source(state: &AppState, source: Source) -> Result<SourceStatus,
+         .and_then(Value::as_str)
+         .map(str::to_string);
+     let (item_count, accounts_imported, snapshots_imported) = match source.id {
+-        "cb" => sync_cb_accounts(state, &snapshot).await?,
+-        "crv" => sync_crv_holdings(state, &snapshot).await?,
++        "cb" => sync_cb_accounts(state, &snapshot, &today).await?,
++        "crv" => sync_crv_holdings(state, &snapshot, &today).await?,
+         _ => return Err("Fonte de sincronização não suportada.".into()),
+     };
+ 
+@@ -205,18 +268,123 @@ async fn fetch_source(state: &AppState, source: Source) -> Result<SourceStatus,
+         accounts_imported: Some(accounts_imported),
+         snapshots_imported: Some(snapshots_imported),
+         error: None,
++        applied_on: Some(today),
+     })
+ }
+ 
++fn today_in_user_timezone(state: &AppState) -> String {
++    let timezone = state.timezone.read().unwrap().clone();
++    user_today(parse_user_timezone_or_default(&timezone)).to_string()
++}
++
++/// Whether the change feed can stand in for a full snapshot this time.
++fn needs_change_check(previous: &SourceStatus, today: &str, force: bool) -> bool {
++    !force
++        && previous.state == "ready"
++        && previous.high_watermark.is_some()
++        && previous.applied_on.as_deref() == Some(today)
++}
++
++/// `Some(false)` when the feed has nothing after the checkpoint. `None` when the
++/// source has no feed (404), which means "cannot tell": import in full.
++async fn changed_since(
++    source: Source,
++    authorization: Option<&str>,
++    checkpoint: Option<&str>,
++) -> Result<Option<bool>, String> {
++    let query = match checkpoint {
++        Some(value) => format!("?after={}&limit=1", percent_encode(value)),
++        None => "?limit=1".to_string(),
++    };
++    let (status, body) = request(
++        source,
++        format!("{}/changes{}", source.base_url, query),
++        authorization,
++    )
++    .await?;
++    if status == 404 {
++        return Ok(None);
++    }
++    if !(200..300).contains(&status) {
++        return Err(format!("Fonte {} retornou HTTP {}.", source.id, status));
++    }
++    let body: Value = serde_json::from_str(&body)
++        .map_err(|_| format!("Fonte {} retornou JSON inválido.", source.id))?;
++    let has_items = body
++        .get("items")
++        .and_then(Value::as_array)
++        .is_some_and(|items| !items.is_empty());
++    Ok(Some(has_items))
++}
++
++fn percent_encode(value: &str) -> String {
++    let mut encoded = String::with_capacity(value.len());
++    for byte in value.bytes() {
++        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
++            encoded.push(byte as char);
++        } else {
++            encoded.push_str(&format!("%{byte:02X}"));
++        }
++    }
++    encoded
++}
++
++fn marker(source_id: &str) -> String {
++    format!("{MARKER_PREFIX}:{source_id}")
++}
++
++struct AccountSpec<'a> {
++    marker: String,
++    provider: &'a str,
++    provider_account_id: &'a str,
++    name: String,
++    currency: &'a str,
++    account_type: &'a str,
++}
++
++struct SyncedAccount {
++    id: String,
++    currency: String,
++}
++
+ async fn sync_cb_accounts(
+     state: &AppState,
+     snapshot: &Value,
++    today: &str,
+ ) -> Result<(usize, usize, usize), String> {
+     let items = snapshot
+         .get("items")
+         .and_then(Value::as_array)
+         .ok_or_else(|| "Snapshot CB v4 inválido: lista de itens ausente.".to_string())?;
+-    let base_currency = state.base_currency.read().unwrap().clone();
++    let coverage = snapshot.get("coverage");
++    // The source must declare the three collections complete before anything is
++    // applied or cleared, and the declared counts must match what arrived.
++    for name in ["account", "cash_entry", "category"] {
++        let declared = coverage
++            .and_then(|coverage| coverage.get(name))
++            .and_then(|value| value.get("count"))
++            .and_then(Value::as_u64);
++        let found = items
++            .iter()
++            .filter(|item| item.get("resource").and_then(Value::as_str) == Some(name))
++            .count() as u64;
++        let state_ok = coverage
++            .and_then(|coverage| coverage.get(name))
++            .and_then(|value| value.get("state"))
++            .and_then(Value::as_str)
++            == Some("complete");
++        if !state_ok || declared != Some(found) {
++            return Err(format!(
++                "Snapshot CB v4 inválido: cobertura de {name} incompleta."
++            ));
++        }
++    }
++
++    let reference_date = snapshot
++        .get("snapshot_as_of")
++        .and_then(Value::as_str)
++        .map(str::to_string);
++    let mut imported_sources = BTreeSet::new();
+     let mut accounts_synced = 0;
+     let mut snapshots_saved = 0;
+     for item in items {
+@@ -229,47 +397,86 @@ async fn sync_cb_accounts(
+         let source_id = required_string(payload, "source_id", "ID da conta CB")?;
+         let name = required_string(payload, "name", "nome da conta CB")?;
+         let currency = required_string(payload, "currency", "moeda da conta CB")?;
++        imported_sources.insert(marker(source_id));
++
+         let account_kind = payload.get("account_type").and_then(Value::as_str);
+         // The first management phase imports cash only. Credit cards and
+         // applications use different operational semantics in CB.
+         if matches!(account_kind, Some("cartao_credito" | "aplicacao")) {
+             continue;
+         }
+-        let account_id = ensure_source_account(
++        // A missing balance is not a zero balance: nothing is written.
++        let Some(balance) = payload.get("balance").and_then(Value::as_str) else {
++            continue;
++        };
++        let balance_date = reference_date
++            .clone()
++            .or_else(|| {
++                payload
++                    .get("balance_as_of")
++                    .and_then(Value::as_str)
++                    .map(str::to_string)
++            })
++            .unwrap_or_else(|| today.to_string());
++        let snapshot_date = NaiveDate::parse_from_str(&balance_date, "%Y-%m-%d")
++            .map_err(|_| "Conta CB v4 inválida: data do saldo ausente.".to_string())?;
++
++        let account = ensure_source_account(
+             state,
+-            source_id,
+-            name,
+-            &currency,
+-            "PATRIMONIO_CB",
+-            account_types::CASH,
+-            TrackingMode::Holdings,
++            &AccountSpec {
++                marker: marker(source_id),
++                provider: CB_PROVIDER,
++                provider_account_id: source_id,
++                name: format!("CB · {name}"),
++                currency,
++                account_type: account_types::CASH,
++            },
+         )
+         .await?;
+         accounts_synced += 1;
++        save_source_snapshot(
++            state,
++            &account.id,
++            &account.currency,
++            snapshot_date,
++            Vec::new(),
++            vec![CashBalanceInput {
++                currency: currency.to_string(),
++                amount: parse_decimal(balance, "saldo CB")?,
++            }],
++        )
++        .await?;
++        snapshots_saved += 1;
++    }
+ 
+-        let balance = payload.get("balance").and_then(Value::as_str);
+-        let balance_date = payload
+-            .get("balance_as_of")
+-            .and_then(Value::as_str)
+-            .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+-        if let (Some(balance), Some(snapshot_date)) = (balance, balance_date) {
+-            save_source_snapshot(
+-                state,
+-                &account_id,
+-                &currency,
+-                snapshot_date,
+-                Vec::new(),
+-                vec![CashBalanceInput {
+-                    currency: currency.to_string(),
+-                    amount: parse_decimal(balance, "saldo CB")?,
+-                }],
+-                &base_currency,
+-            )
+-            .await?;
+-            snapshots_saved += 1;
+-        } else if balance_date.is_none() && balance.is_some() {
+-            return Err("Conta CB v4 inválida: data do saldo ausente.".into());
++    // Absence is only safe to reconcile because the source declared the account
++    // collection complete (checked above): an account that left the source gets
++    // a zero balance instead of keeping a stale one.
++    let clear_date = reference_date
++        .as_deref()
++        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
++        .or_else(|| NaiveDate::parse_from_str(today, "%Y-%m-%d").ok())
++        .ok_or_else(|| "Snapshot CB v4 inválido: data de referência ausente.".to_string())?;
++    for stale in accounts_with_marker_prefix(state, &marker(CB_ACCOUNT_PREFIX))? {
++        if stale
++            .meta
++            .as_deref()
++            .is_some_and(|meta| imported_sources.contains(meta))
++        {
++            continue;
+         }
++        save_source_snapshot(
++            state,
++            &stale.id,
++            &stale.currency,
++            clear_date,
++            Vec::new(),
++            vec![CashBalanceInput {
++                currency: stale.currency.clone(),
++                amount: Decimal::ZERO,
++            }],
++        )
++        .await?;
+     }
+ 
+     Ok((items.len(), accounts_synced, snapshots_saved))
+@@ -278,132 +485,233 @@ async fn sync_cb_accounts(
+ async fn sync_crv_holdings(
+     state: &AppState,
+     snapshot: &Value,
++    today: &str,
+ ) -> Result<(usize, usize, usize), String> {
+-    let accounts = snapshot.get("accounts").and_then(Value::as_array)
+-        .ok_or_else(|| "Snapshot CRV v4 inválido: contas ausentes.".to_string())?;
+-    let holdings = snapshot.get("holdings").and_then(Value::as_array)
++    let holdings = snapshot
++        .get("holdings")
++        .and_then(Value::as_array)
+         .ok_or_else(|| "Snapshot CRV v4 inválido: posições ausentes.".to_string())?;
+-    let base_currency = state.base_currency.read().unwrap().clone();
+-    let snapshot_date = snapshot.get("data_de_referencia").and_then(Value::as_str)
+-        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+-        .ok_or_else(|| "Snapshot CRV v4 inválido: data de referência ausente.".to_string())?;
+-
+-    let mut account_catalog = std::collections::BTreeMap::new();
+-    for account in accounts {
+-        let external_id = required_string(account, "id", "chave da conta CRV")?;
+-        let source_id = required_string(account, "source_id", "ID da conta CRV")?;
+-        let name = required_string(account, "name", "nome da conta CRV")?;
+-        account_catalog.insert(external_id.to_string(), (source_id.to_string(), name.to_string()));
++    // CRV declares the pilot as real, open equities only. Without a complete
++    // declaration nothing is applied and nothing is cleared.
++    if snapshot
++        .get("coverage")
++        .and_then(|coverage| coverage.get("holdings"))
++        .and_then(|holdings| holdings.get("complete"))
++        .and_then(Value::as_bool)
++        != Some(true)
++    {
++        return Err("Snapshot CRV v4 inválido: cobertura de posições incompleta.".into());
+     }
++    let snapshot_date = snapshot
++        .get("data_de_referencia")
++        .and_then(Value::as_str)
++        .or_else(|| snapshot.get("snapshot_as_of").and_then(Value::as_str))
++        .unwrap_or(today);
++    let snapshot_date = NaiveDate::parse_from_str(snapshot_date, "%Y-%m-%d")
++        .map_err(|_| "Snapshot CRV v4 inválido: data de referência ausente.".to_string())?;
+ 
+-    // CRV declares this pilot as real, open equities only. Accounts that only
+-    // appear in analytic income are intentionally not materialized here.
+-    let mut account_ids: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+-    let mut positions_by_account: std::collections::BTreeMap<String, Vec<ManualHoldingInput>> = std::collections::BTreeMap::new();
++    // One account per (CRV account, portfolio, currency), the way the add-on
++    // always grouped them.
++    struct Group {
++        name: String,
++        currency: String,
++        positions: Vec<ManualHoldingInput>,
++    }
++    let mut groups: BTreeMap<String, Group> = BTreeMap::new();
+     for holding in holdings {
+         if holding.get("instrument_type").and_then(Value::as_str) != Some("equity") {
+             return Err("Snapshot CRV v4 contém instrumento fora do escopo de ações.".into());
+         }
+-        let external_account_id = required_string(holding, "account", "conta da posição CRV")?;
+-        let account_id = if let Some(account_id) = account_ids.get(external_account_id) {
+-            account_id.clone()
+-        } else {
+-            let (source_id, name) = account_catalog.get(external_account_id).cloned()
+-                .ok_or_else(|| "Snapshot CRV v4 inválido: posição sem conta correspondente.".to_string())?;
+-            let account_id = ensure_source_account(state, &source_id, &name, &base_currency,
+-                "PATRIMONIO_CRV", account_types::SECURITIES, TrackingMode::Holdings).await?;
+-            account_ids.insert(external_account_id.to_string(), account_id.clone());
+-            account_id
+-        };
++        let account = required_string(holding, "account", "conta da posição CRV")?;
++        let portfolio = required_string(holding, "portfolio", "carteira da posição CRV")?;
++        let account_name = required_string(holding, "account_name", "nome da conta CRV")?;
+         let symbol = required_string(holding, "instrument", "instrumento CRV")?;
+         let currency = required_string(holding, "currency", "moeda da posição CRV")?;
+-        let instrument_key = format!("{}:{}:{}", holding.get("market").and_then(Value::as_str).unwrap_or_default(), symbol, currency);
++        let market = holding.get("market").and_then(Value::as_str);
+         let quantity = parse_decimal_field(holding, "quantity", "quantidade CRV")?;
+         let average_cost = parse_decimal_field(holding, "average_cost", "custo médio CRV")?;
+-        positions_by_account.entry(account_id).or_default().push(ManualHoldingInput {
+-            asset_id: Some(stable_id("crv-asset", &instrument_key)),
++        let group = groups
++            .entry(format!("{account}:{portfolio}:{currency}"))
++            .or_insert_with(|| Group {
++                name: format!("CRV · {account_name} · {portfolio}"),
++                currency: currency.to_string(),
++                positions: Vec::new(),
++            });
++        group.positions.push(ManualHoldingInput {
++            asset_id: None,
+             symbol: symbol.to_string(),
+-            exchange_mic: holding.get("market").and_then(Value::as_str).map(str::to_string),
+-            quantity, currency: currency.to_string(), average_cost, name: None,
+-            data_source: None, asset_kind: None, quote_ccy: Some(currency.to_string()),
+-            instrument_type: Some("EQUITY".into()), provider_id: None, provider_symbol: None,
++            exchange_mic: market.map(str::to_string),
++            quantity,
++            currency: currency.to_string(),
++            average_cost,
++            name: None,
++            data_source: Some(DATA_SOURCE.to_string()),
++            asset_kind: None,
++            quote_ccy: Some(currency.to_string()),
++            instrument_type: Some("EQUITY".into()),
++            provider_id: None,
++            provider_symbol: None,
+         });
+     }
+ 
+-    let accounts_synced = account_ids.len();
++    let mut active = BTreeSet::new();
+     let mut snapshots_saved = 0;
+-    for account_id in account_ids.values() {
+-        let positions = positions_by_account.remove(account_id).unwrap_or_default();
+-        save_source_snapshot(state, account_id, &base_currency, snapshot_date, positions, Vec::new(), &base_currency).await?;
++    for (key, group) in groups {
++        let source_id = format!("{CRV_ACCOUNT_PREFIX}{key}");
++        active.insert(marker(&source_id));
++        let account = ensure_source_account(
++            state,
++            &AccountSpec {
++                marker: marker(&source_id),
++                provider: CRV_PROVIDER,
++                provider_account_id: &source_id,
++                name: group.name,
++                currency: &group.currency,
++                account_type: account_types::SECURITIES,
++            },
++        )
++        .await?;
++        save_source_snapshot(
++            state,
++            &account.id,
++            &account.currency,
++            snapshot_date,
++            group.positions,
++            Vec::new(),
++        )
++        .await?;
+         snapshots_saved += 1;
+     }
+-    Ok((holdings.len(), accounts_synced, snapshots_saved))
++
++    // A portfolio that no longer holds anything gets an empty snapshot, which is
++    // what the complete declaration above allows.
++    for stale in accounts_with_marker_prefix(state, &marker(CRV_ACCOUNT_PREFIX))? {
++        if stale
++            .meta
++            .as_deref()
++            .is_some_and(|meta| active.contains(meta))
++        {
++            continue;
++        }
++        save_source_snapshot(
++            state,
++            &stale.id,
++            &stale.currency,
++            snapshot_date,
++            Vec::new(),
++            Vec::new(),
++        )
++        .await?;
++    }
++
++    Ok((holdings.len(), snapshots_saved, snapshots_saved))
+ }
+-async fn ensure_source_account(
+-    state: &AppState,
+-    source_id: &str,
+-    name: &str,
+-    currency: &str,
+-    provider: &str,
+-    account_type: &str,
+-    tracking_mode: TrackingMode,
+-) -> Result<String, String> {
+-    let meta = serde_json::json!({ "sourceId": source_id, "sourceSystem": provider }).to_string();
+-    let existing = state
++
++/// Non-archived accounts whose marker starts with `prefix`.
++fn accounts_with_marker_prefix(state: &AppState, prefix: &str) -> Result<Vec<Account>, String> {
++    Ok(state
+         .account_service
+         .get_all_accounts()
+         .map_err(|_| "Não foi possível consultar as contas locais.".to_string())?
+         .into_iter()
+-        .find(|account| {
+-            account.provider.as_deref() == Some(provider)
+-                && account.provider_account_id.as_deref() == Some(source_id)
+-        });
++        .filter(|account| {
++            !account.is_archived
++                && account
++                    .meta
++                    .as_deref()
++                    .is_some_and(|meta| meta.starts_with(prefix))
++        })
++        .collect())
++}
+ 
+-    if let Some(existing) = existing {
+-        let id = existing.id.clone();
++/// The account that already represents this source, if any. The add-on's marker
++/// wins (that is how accounts created before this worker are adopted), then the
++/// provider identity. Archived accounts are invisible on purpose.
++fn select_existing<'a>(accounts: &'a [Account], spec: &AccountSpec<'_>) -> Option<&'a Account> {
++    let live = || accounts.iter().filter(|account| !account.is_archived);
++    live()
++        .find(|account| account.meta.as_deref() == Some(spec.marker.as_str()))
++        .or_else(|| {
++            live().find(|account| {
++                account.provider.as_deref() == Some(spec.provider)
++                    && account.provider_account_id.as_deref() == Some(spec.provider_account_id)
++            })
++        })
++}
++
++async fn ensure_source_account(
++    state: &AppState,
++    spec: &AccountSpec<'_>,
++) -> Result<SyncedAccount, String> {
++    let accounts = state
++        .account_service
++        .get_all_accounts()
++        .map_err(|_| "Não foi possível consultar as contas locais.".to_string())?;
++
++    if let Some(existing) = select_existing(&accounts, spec) {
++        let unchanged = existing.name == spec.name
++            && existing.account_type == spec.account_type
++            && existing.meta.as_deref() == Some(spec.marker.as_str())
++            && existing.provider.as_deref() == Some(spec.provider)
++            && existing.provider_account_id.as_deref() == Some(spec.provider_account_id)
++            && existing.is_active
++            && existing.tracking_mode == TrackingMode::Holdings;
++        if unchanged {
++            return Ok(SyncedAccount {
++                id: existing.id.clone(),
++                currency: existing.currency.clone(),
++            });
++        }
+         let updated = state
+             .account_service
+             .update_account(AccountUpdate {
+-                id: Some(id),
+-                name: name.to_string(),
+-                account_type: account_type.to_string(),
+-                group: existing.group,
++                id: Some(existing.id.clone()),
++                name: spec.name.clone(),
++                account_type: spec.account_type.to_string(),
++                group: existing.group.clone(),
+                 is_default: false,
+                 is_active: true,
+                 is_archived: Some(false),
+-                tracking_mode: Some(tracking_mode),
+-                platform_id: existing.platform_id,
+-                account_number: existing.account_number,
+-                meta: Some(meta),
+-                provider: Some(provider.to_string()),
+-                provider_account_id: Some(source_id.to_string()),
++                tracking_mode: Some(TrackingMode::Holdings),
++                platform_id: existing.platform_id.clone(),
++                account_number: existing.account_number.clone(),
++                meta: Some(spec.marker.clone()),
++                provider: Some(spec.provider.to_string()),
++                provider_account_id: Some(spec.provider_account_id.to_string()),
+             })
+             .await
+             .map_err(|_| "Não foi possível atualizar a conta importada.".to_string())?;
+-        Ok(updated.id)
+-    } else {
+-        let created = state
+-            .account_service
+-            .create_account(NewAccount {
+-                id: Some(stable_id("patrimonio", &format!("{provider}:{source_id}"))),
+-                name: name.to_string(),
+-                account_type: account_type.to_string(),
+-                group: None,
+-                currency: currency.to_string(),
+-                is_default: false,
+-                is_active: true,
+-                platform_id: None,
+-                account_number: None,
+-                meta: Some(meta),
+-                provider: Some(provider.to_string()),
+-                provider_account_id: Some(source_id.to_string()),
+-                is_archived: false,
+-                tracking_mode,
+-            })
+-            .await
+-            .map_err(|_| "Não foi possível criar a conta importada.".to_string())?;
+-        Ok(created.id)
++        return Ok(SyncedAccount {
++            id: updated.id,
++            currency: existing.currency.clone(),
++        });
+     }
++
++    let created = state
++        .account_service
++        .create_account(NewAccount {
++            // A new id family: the older ones may belong to archived accounts.
++            id: Some(stable_id("patrimonio-v2", &spec.marker)),
++            name: spec.name.clone(),
++            account_type: spec.account_type.to_string(),
++            group: None,
++            currency: spec.currency.to_string(),
++            is_default: false,
++            is_active: true,
++            platform_id: None,
++            account_number: None,
++            meta: Some(spec.marker.clone()),
++            provider: Some(spec.provider.to_string()),
++            provider_account_id: Some(spec.provider_account_id.to_string()),
++            is_archived: false,
++            tracking_mode: TrackingMode::Holdings,
++        })
++        .await
++        .map_err(|_| "Não foi possível criar a conta importada.".to_string())?;
++    Ok(SyncedAccount {
++        id: created.id,
++        currency: spec.currency.to_string(),
++    })
+ }
+ 
+ async fn save_source_snapshot(
+@@ -413,9 +721,9 @@ async fn save_source_snapshot(
+     snapshot_date: NaiveDate,
+     positions: Vec<ManualHoldingInput>,
+     cash_balances: Vec<CashBalanceInput>,
+-    base_currency: &str,
+ ) -> Result<(), String> {
+     let timezone = state.timezone.read().unwrap().clone();
++    let base_currency = state.base_currency.read().unwrap().clone();
+     ManualSnapshotService::new(
+         state.asset_service.clone(),
+         state.fx_service.clone(),
+@@ -429,7 +737,7 @@ async fn save_source_snapshot(
+         snapshot_date,
+         positions,
+         cash_balances,
+-        base_currency: Some(base_currency.to_string()),
++        base_currency: Some(base_currency),
+         source: SnapshotSource::BrokerImported,
+     })
+     .await
+@@ -465,16 +773,15 @@ fn parse_decimal(value: &str, label: &str) -> Result<Decimal, String> {
+         .map_err(|_| format!("Snapshot v4 inválido: {label} inválido."))
+ }
+ 
+-async fn request_json(
++async fn request(
+     source: Source,
+     url: String,
+     authorization: Option<&str>,
+-    host: &str,
+-) -> Result<Value, String> {
++) -> Result<(u16, String), String> {
+     let request = AddonNetworkRequest {
+         url,
+         method: Some("GET".into()),
+-        headers: Some(std::collections::BTreeMap::from([(
++        headers: Some(BTreeMap::from([(
+             "X-Forwarded-Proto".to_string(),
+             "https".to_string(),
+         )])),
+@@ -483,17 +790,24 @@ async fn request_json(
+         timeout_secs: Some(20),
+         injected_authorization: authorization.map(str::to_string),
+     };
+-    let response = perform_addon_network_request(ADDON_ID, &[host.to_string()], request)
++    let response = perform_addon_network_request(ADDON_ID, &[source.host.to_string()], request)
+         .await
+         .map_err(|_| format!("Fonte {} indisponível ou fora da allowlist.", source.id))?;
+-    if !(200..300).contains(&response.status) {
+-        return Err(format!(
+-            "Fonte {} retornou HTTP {}.",
+-            source.id, response.status
+-        ));
++    Ok((response.status, response.body))
++}
++
++async fn request_json(
++    source: Source,
++    url: String,
++    authorization: Option<&str>,
++) -> Result<(u16, Value), String> {
++    let (status, body) = request(source, url, authorization).await?;
++    if !(200..300).contains(&status) {
++        return Err(format!("Fonte {} retornou HTTP {}.", source.id, status));
+     }
+-    serde_json::from_str(&response.body)
+-        .map_err(|_| format!("Fonte {} retornou JSON inválido.", source.id))
++    let value = serde_json::from_str(&body)
++        .map_err(|_| format!("Fonte {} retornou JSON inválido.", source.id))?;
++    Ok((status, value))
+ }
+ 
+ fn validate_contract(value: &Value) -> Result<(), String> {
+@@ -521,17 +835,73 @@ fn load_statuses(settings: &dyn SettingsServiceTrait) -> Vec<SourceStatus> {
+         .collect()
+ }
+ 
+-async fn persist_status(
+-    settings: &dyn SettingsServiceTrait,
+-    key: &str,
+-    status: &SourceStatus,
+-) -> ApiResult<()> {
++/// Saves the status where this module reads it back, and a copy in the add-on's
++/// storage, which is where the add-on's status screen reads it. The copy is
++/// best effort: the screen is a convenience, the setting is the record.
++async fn persist_status(state: &AppState, source: &Source, status: &SourceStatus) -> ApiResult<()> {
+     let serialized = serde_json::to_string(status)
+         .map_err(|_| ApiError::Internal("Falha ao salvar checkpoint de sincronização.".into()))?;
+-    settings
+-        .set_setting_value(key, &serialized)
++    state
++        .settings_service
++        .set_setting_value(source.checkpoint_key, &serialized)
+         .await
+-        .map_err(|_| ApiError::Internal("Falha ao salvar checkpoint de sincronização.".into()))
++        .map_err(|_| ApiError::Internal("Falha ao salvar checkpoint de sincronização.".into()))?;
++    if let Err(error) = state
++        .addon_service
++        .set_addon_storage_item(
++            ADDON_ID,
++            &format!("{STATUS_STORAGE_PREFIX}{}", source.id),
++            &serialized,
++        )
++        .await
++    {
++        tracing::debug!("Estado da sincronização patrimonial não copiado para o add-on: {error}");
++    }
++    Ok(())
++}
++
++/// `None` keeps the worker off: unset, `0`, or anything that is not a number.
++fn parse_interval(raw: Option<&str>) -> Option<Duration> {
++    let seconds = raw?.trim().parse::<u64>().ok()?;
++    (seconds > 0).then(|| Duration::from_secs(seconds.max(MIN_INTERVAL_SECS)))
++}
++
++/// Whether the periodic import is switched on. It decides if profiles are opened
++/// at startup, because the worker lives in the profile's runtime.
++pub(crate) fn scheduler_enabled() -> bool {
++    parse_interval(std::env::var(INTERVAL_ENV).ok().as_deref()).is_some()
++}
++
++/// Starts the periodic import. It never needs a browser: the daily snapshot
++/// used to depend on someone having the add-on open.
++pub(crate) fn start_scheduler(state: Arc<AppState>) {
++    let Some(every) = parse_interval(std::env::var(INTERVAL_ENV).ok().as_deref()) else {
++        tracing::info!("Patrimonio sync scheduler off: {INTERVAL_ENV} is not set");
++        return;
++    };
++    tracing::info!(
++        "Patrimonio sync scheduler started (every {}s)",
++        every.as_secs()
++    );
++    let runtime = state.clone();
++    let worker = tokio::spawn(async move {
++        tokio::time::sleep(Duration::from_secs(INITIAL_DELAY_SECS)).await;
++        let mut ticker = tokio::time::interval(every);
++        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
++        loop {
++            ticker.tick().await;
++            match run_sync(&runtime, false).await {
++                None => tracing::debug!("Patrimonio sync skipped: a run is already in progress"),
++                Some(Err(_)) => tracing::warn!("Patrimonio sync could not save its status"),
++                Some(Ok(statuses)) => {
++                    for status in statuses.iter().filter(|status| status.state == "failed") {
++                        tracing::warn!("Patrimonio sync failed for source {}", status.source);
++                    }
++                }
++            }
++        }
++    });
++    state.workers.lock().unwrap().push(worker);
+ }
+ 
+ pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
+@@ -544,6 +914,28 @@ pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
+ mod tests {
+     use super::*;
+ 
++    fn account(id: &str, meta: Option<&str>, provider_id: Option<&str>, archived: bool) -> Account {
++        Account {
++            id: id.into(),
++            meta: meta.map(str::to_string),
++            provider: provider_id.map(|_| CB_PROVIDER.to_string()),
++            provider_account_id: provider_id.map(str::to_string),
++            is_archived: archived,
++            ..Account::default()
++        }
++    }
++
++    fn spec(source_id: &str) -> AccountSpec<'_> {
++        AccountSpec {
++            marker: marker(source_id),
++            provider: CB_PROVIDER,
++            provider_account_id: source_id,
++            name: "CB · Conta".into(),
++            currency: "BRL",
++            account_type: account_types::CASH,
++        }
++    }
++
+     #[test]
+     fn validates_v4_contract() {
+         assert!(validate_contract(&serde_json::json!({"contrato": "patrimonio/v4"})).is_ok());
+@@ -554,10 +946,120 @@ mod tests {
+     fn source_urls_use_the_internal_aliases_and_v4_path() {
+         assert_eq!(CB_BASE_URL, "http://cb-api:8000/patrimonio/v4");
+         assert_eq!(CRV_BASE_URL, "http://crv-api:5003/patrimonio/v4");
+-        assert!(
+-            SOURCES
+-                .iter()
+-                .all(|source| source.base_url.ends_with("/patrimonio/v4"))
++        assert!(SOURCES
++            .iter()
++            .all(|source| source.base_url.ends_with("/patrimonio/v4")));
++    }
++
++    #[test]
++    fn the_marker_is_the_one_the_addon_writes() {
++        assert_eq!(
++            marker("controle-bancario:account:abc"),
++            "controlePatrimonial:controle-bancario:account:abc"
++        );
++        assert_eq!(
++            marker(&format!("{CRV_ACCOUNT_PREFIX}1:2:USD")),
++            "controlePatrimonial:crv:1:2:USD"
++        );
++        assert!(marker("controle-bancario:account:abc").starts_with(&marker(CB_ACCOUNT_PREFIX)));
++    }
++
++    #[test]
++    fn an_account_created_by_the_addon_is_adopted() {
++        let accounts = [account("a", Some("controlePatrimonial:src"), None, false)];
++        assert_eq!(
++            select_existing(&accounts, &spec("src")).map(|a| a.id.as_str()),
++            Some("a")
++        );
++    }
++
++    #[test]
++    fn the_marker_wins_over_the_provider_identity() {
++        let accounts = [
++            account("server", Some("{\"sourceId\":\"src\"}"), Some("src"), false),
++            account("addon", Some("controlePatrimonial:src"), None, false),
++        ];
++        assert_eq!(
++            select_existing(&accounts, &spec("src")).map(|a| a.id.as_str()),
++            Some("addon")
+         );
+     }
++
++    #[test]
++    fn an_account_with_only_the_provider_identity_is_still_found() {
++        let accounts = [account("server", None, Some("src"), false)];
++        assert_eq!(
++            select_existing(&accounts, &spec("src")).map(|a| a.id.as_str()),
++            Some("server")
++        );
++    }
++
++    #[test]
++    fn archived_accounts_are_never_selected() {
++        let accounts = [
++            account("old", Some("controlePatrimonial:src"), Some("src"), true),
++            account("other", Some("controlePatrimonial:other"), None, false),
++        ];
++        assert!(select_existing(&accounts, &spec("src")).is_none());
++    }
++
++    #[test]
++    fn the_change_feed_only_replaces_a_snapshot_after_a_good_import_today() {
++        let mut previous = SourceStatus {
++            state: "ready".into(),
++            high_watermark: Some("w".into()),
++            applied_on: Some("2026-10-03".into()),
++            ..SourceStatus::default()
++        };
++        assert!(needs_change_check(&previous, "2026-10-03", false));
++        assert!(!needs_change_check(&previous, "2026-10-03", true));
++        assert!(!needs_change_check(&previous, "2026-10-04", false));
++        previous.high_watermark = None;
++        assert!(!needs_change_check(&previous, "2026-10-03", false));
++        previous.high_watermark = Some("w".into());
++        previous.state = "failed".into();
++        assert!(!needs_change_check(&previous, "2026-10-03", false));
++        previous.state = "ready".into();
++        previous.applied_on = None;
++        assert!(!needs_change_check(&previous, "2026-10-03", false));
++    }
++
++    #[test]
++    fn the_interval_is_off_unless_asked_for_and_never_below_a_minute() {
++        assert_eq!(parse_interval(None), None);
++        assert_eq!(parse_interval(Some("")), None);
++        assert_eq!(parse_interval(Some("0")), None);
++        assert_eq!(parse_interval(Some("abc")), None);
++        assert_eq!(
++            parse_interval(Some(" 900 ")),
++            Some(Duration::from_secs(900))
++        );
++        assert_eq!(
++            parse_interval(Some("5")),
++            Some(Duration::from_secs(MIN_INTERVAL_SECS))
++        );
++    }
++
++    #[test]
++    fn a_missing_token_is_not_a_failure() {
++        assert_eq!(
++            failure_state("Addon network auth secret was not found"),
++            "not_configured"
++        );
++        assert_eq!(failure_state("Fonte cb retornou HTTP 500."), "failed");
++    }
++
++    #[test]
++    fn cursors_are_percent_encoded_for_the_query() {
++        assert_eq!(percent_encode("abc-1._~"), "abc-1._~");
++        assert_eq!(percent_encode("a b/c+d=e"), "a%20b%2Fc%2Bd%3De");
++    }
++
++    #[test]
++    fn statuses_saved_before_this_version_still_load() {
++        let old = r#"{"source":"cb","state":"ready","updatedAt":null,"snapshotId":null,
++            "highWatermark":"w","itemCount":1,"accountsImported":1,"snapshotsImported":1,"error":null}"#;
++        let status: SourceStatus = serde_json::from_str(old).unwrap();
++        assert_eq!(status.applied_on, None);
++    }
+ }
+diff --git a/apps/server/src/profiles.rs b/apps/server/src/profiles.rs
+index b4e2ecf..f8a8261 100644
+--- a/apps/server/src/profiles.rs
++++ b/apps/server/src/profiles.rs
+@@ -309,20 +309,26 @@ impl WebProfiles {
+     pub fn start_connected_profiles(self: &Arc<Self>) {
+         let root = self.clone();
+         tokio::spawn(async move {
++            // A profile's runtime, and the background workers that live in it, only
++            // open when something asks for it: a request, or a Connect token. The
++            // patrimonio import has to run after every restart without anyone
++            // opening the page, so enabling it opens every profile here.
++            let patrimonio_sync = crate::api::patrimonio_sync::scheduler_enabled();
+             if let Ok(profiles) = root.registry.list() {
+                 for profile in profiles {
+-                    if root
+-                        .registry
+-                        .profile(profile.id)
+-                        .ok()
+-                        .and_then(|p| {
+-                            root.registry
+-                                .secret_store(&p)
+-                                .get_secret(wealthfolio_core::secrets::CLOUD_REFRESH_TOKEN_KEY)
+-                                .ok()
+-                                .flatten()
+-                        })
+-                        .is_some()
++                    if patrimonio_sync
++                        || root
++                            .registry
++                            .profile(profile.id)
++                            .ok()
++                            .and_then(|p| {
++                                root.registry
++                                    .secret_store(&p)
++                                    .get_secret(wealthfolio_core::secrets::CLOUD_REFRESH_TOKEN_KEY)
++                                    .ok()
++                                    .flatten()
++                            })
++                            .is_some()
+                     {
+                         if let Err((status, _)) = root.runtime(profile.id).await {
+                             tracing::warn!(%status, "Profile sync startup deferred");
+diff --git a/apps/server/src/scheduler.rs b/apps/server/src/scheduler.rs
+index aafac3d..ae47578 100644
+--- a/apps/server/src/scheduler.rs
++++ b/apps/server/src/scheduler.rs
+@@ -181,6 +181,9 @@ pub fn start_background_workers(state: Arc<AppState>) {
+     // Start background broker sync scheduler (4-hour interval)
+     start_broker_sync_scheduler(state.clone());
+ 
++    // CB/CRV patrimonio import (opt-in through WF_PATRIMONIO_SYNC_INTERVAL_SECS)
++    crate::api::patrimonio_sync::start_scheduler(state.clone());
++
+     // Start periodic market data sync (6h interval, 2min initial delay)
+     let quote_svc = state.quote_service.clone();
+     let worker = tokio::spawn(async move {

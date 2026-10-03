@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { AddonContext, AddonEnableFunction, SnapshotHoldingInput } from '@wealthfolio/addon-sdk';
+import type { AddonContext, AddonEnableFunction } from '@wealthfolio/addon-sdk';
 
 const CB_BASE_URLS = [
   'http://host.docker.internal:5201/patrimonio/v4',
@@ -11,7 +11,6 @@ const CRV_BASE_URLS = [
 ];
 const CB_TOKEN_KEY = 'cb.token';
 const CRV_TOKEN_KEY = 'crv.token';
-const ACCOUNT_META_KEY = 'controlePatrimonial';
 const AUTO_SYNC_ENABLED_KEY = 'sync.enabled';
 const AUTO_SYNC_INTERVAL_MS = 15 * 60 * 1000;
 const CB_CHECKPOINT_KEY = 'checkpoint.cb';
@@ -21,33 +20,15 @@ const CRV_SYNC_STATUS_KEY = 'sync.status.crv';
 const CB_RECORDS_KEY = 'records.cb.v1';
 const CRV_RECORDS_KEY = 'records.crv.v1';
 const STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
+// O servidor grava aqui o estado de cada importação (ver patrimonio_sync.rs, patch 0004).
+const SERVER_STATUS_KEY_PREFIX = 'server.status.';
+// A importação roda a cada 15 min; uma hora sem verificar já merece aviso.
+const SERVER_STALE_AFTER_MS = 60 * 60 * 1000;
 const RECORDS_PAGE_SIZE = 50;
 const STORAGE_CHUNK_LIMIT_BYTES = 180_000;
 const SANITIZED_FAILURE = 'Falha ao sincronizar esta fonte. Verifique a disponibilidade e tente novamente.';
 
 let activeSync: Promise<void> | undefined;
-
-interface CbAccount {
-  source_id: string;
-  name: string;
-  account_type: string;
-  currency: string;
-  balance: string | null;
-}
-
-interface CrvHolding {
-  source_id: string;
-  account: string;
-  account_name: string;
-  portfolio: string;
-  instrument: string;
-  market: string;
-  currency: string;
-  quantity: string;
-  average_cost: string;
-  current_price: string | null;
-  instrument_type: 'equity';
-}
 
 interface SnapshotEnvelope {
   contrato?: string;
@@ -55,14 +36,12 @@ interface SnapshotEnvelope {
   snapshot_id?: string;
   generated_at?: string;
   high_watermark?: string | null;
-  accounts?: CbAccount[];
   items?: Array<{ resource: string; source_id?: string; payload: Record<string, unknown> }>;
-  holdings?: CrvHolding[];
+  holdings?: Array<{ instrument_type?: string }>;
   income?: CrvIncome[];
-  data_de_referencia?: string;
-  snapshot_as_of?: string;
   coverage?: {
-    account?: { state?: string };
+    account?: { state?: string; count?: number };
+    category?: { state?: string; count?: number };
     cash_entry?: Record<string, unknown>;
     holdings?: { complete?: boolean };
     income?: { included?: number; scope?: string; role?: string; do_not_rebook_as_cash?: boolean };
@@ -150,6 +129,67 @@ interface AppliedSnapshot {
   generatedAt: string;
   highWatermark: string | null;
   coverageComplete: boolean;
+}
+
+type ServerStateValue = 'not_started' | 'running' | 'ready' | 'failed' | 'not_configured';
+
+interface ServerSyncStatus {
+  state: ServerStateValue;
+  updatedAt: string | null;
+  snapshotId: string | null;
+  highWatermark: string | null;
+  accountsImported: number | null;
+  snapshotsImported: number | null;
+  appliedOn: string | null;
+  error: string | null;
+}
+
+const emptyServerStatus = (): ServerSyncStatus => ({
+  state: 'not_started',
+  updatedAt: null,
+  snapshotId: null,
+  highWatermark: null,
+  accountsImported: null,
+  snapshotsImported: null,
+  appliedOn: null,
+  error: null,
+});
+
+function readServerStatus(value: string | null | undefined): ServerSyncStatus {
+  if (!value) return emptyServerStatus();
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    const states: ServerStateValue[] = ['not_started', 'running', 'ready', 'failed', 'not_configured'];
+    if (!states.includes(parsed.state as ServerStateValue)) return emptyServerStatus();
+    const text = (key: string) => (typeof parsed[key] === 'string' ? parsed[key] as string : null);
+    const count = (key: string) => (typeof parsed[key] === 'number' ? parsed[key] as number : null);
+    return {
+      state: parsed.state as ServerStateValue,
+      updatedAt: text('updatedAt'),
+      snapshotId: text('snapshotId'),
+      highWatermark: text('highWatermark'),
+      accountsImported: count('accountsImported'),
+      snapshotsImported: count('snapshotsImported'),
+      appliedOn: text('appliedOn'),
+      // As mensagens do servidor já saem sem URL, token ou payload; só limitamos o tamanho.
+      error: typeof parsed.error === 'string' ? (parsed.error as string).slice(0, 160) : null,
+    };
+  } catch {
+    return emptyServerStatus();
+  }
+}
+
+function describeServerStatus(status: ServerSyncStatus, now = Date.now()): { label: string; tone: 'ok' | 'warn' | 'error' } {
+  switch (status.state) {
+    case 'ready': {
+      const age = status.updatedAt ? now - Date.parse(status.updatedAt) : Number.POSITIVE_INFINITY;
+      return age > SERVER_STALE_AFTER_MS ? { label: 'Atrasada', tone: 'warn' } : { label: 'Em dia', tone: 'ok' };
+    }
+    case 'running': return { label: 'Importando', tone: 'ok' };
+    case 'failed': return { label: 'Falhou', tone: 'error' };
+    case 'not_configured': return { label: 'Token não configurado', tone: 'warn' };
+    default: return { label: 'Ainda não rodou', tone: 'warn' };
+  }
 }
 
 const emptySourceStatus = (): SourceSyncStatus => ({
@@ -245,10 +285,6 @@ async function loadRecordSet(ctx: AddonContext, prefix: string): Promise<SourceR
     records.push(...parsed as SourceRecord[]);
   }
   return records;
-}
-
-function sourceAccountId(source: string) {
-  return `${ACCOUNT_META_KEY}:${source}`;
 }
 
 async function requestFromSource(
@@ -451,41 +487,8 @@ async function changedSinceCheckpoint(
   return body.high_watermark;
 }
 
-async function findOrCreateAccount(
-  ctx: AddonContext,
-  source: string,
-  name: string,
-  currency: string,
-  accountType: 'CASH' | 'SECURITIES',
-) {
-  const marker = sourceAccountId(source);
-  const existing = (await ctx.api.accounts.getAll()).find((account) => account.meta === marker);
-  if (existing) return existing;
-  return await ctx.api.accounts.create({
-    name,
-    accountType,
-    currency,
-    trackingMode: 'HOLDINGS',
-    isActive: true,
-    isDefault: false,
-    meta: marker,
-  }) as { id: string };
-}
-
 async function syncCb(ctx: AddonContext): Promise<AppliedSnapshot> {
   const snapshot = await fetchSnapshot(ctx, CB_BASE_URLS, CB_TOKEN_KEY, 'controle-bancario');
-  const accounts = snapshot.accounts ?? snapshot.items
-    ?.filter((item) => item.resource === 'account')
-    .map((item) => item.payload) ?? [];
-  const date = snapshot.snapshot_as_of ?? new Date().toISOString().slice(0, 10);
-  const importedSources = new Set<string>();
-  for (const account of accounts) {
-    importedSources.add(sourceAccountId(account.source_id));
-    if (account.balance === null) continue;
-    if (account.account_type === 'cartao_credito' || account.account_type === 'aplicacao') continue;
-    const target = await findOrCreateAccount(ctx, account.source_id, `CB · ${account.name}`, account.currency, 'CASH');
-    await ctx.api.snapshots.save(target.id, [], { [account.currency]: account.balance }, date);
-  }
   const previousCbRaw = await ctx.api.storage.get(CB_RECORDS_KEY);
   let previousCbCacheId: string | null = null;
   try { previousCbCacheId = (JSON.parse(previousCbRaw ?? '{}') as { cacheId?: string }).cacheId ?? null; } catch { previousCbCacheId = null; }
@@ -516,16 +519,6 @@ async function syncCb(ctx: AddonContext): Promise<AppliedSnapshot> {
       await deleteRecordSet(ctx, `${CB_RECORDS_KEY}.${previousCbCacheId}.${name}`);
     }
   }
-  // A missing resource is not a zero balance. Only a source that explicitly
-  // declares the account collection complete may clear a prior local snapshot.
-  if (snapshot.coverage?.account?.state === 'complete') {
-    const existing = await ctx.api.accounts.getAll();
-    for (const account of existing) {
-      if (!account.meta?.startsWith(`${ACCOUNT_META_KEY}:controle-bancario:account:`)) continue;
-      if (importedSources.has(account.meta)) continue;
-      await ctx.api.snapshots.save(account.id, [], { [account.currency]: '0.00' }, date);
-    }
-  }
   return {
     snapshotId: snapshot.snapshot_id!,
     generatedAt: snapshot.generated_at!,
@@ -536,35 +529,8 @@ async function syncCb(ctx: AddonContext): Promise<AppliedSnapshot> {
 
 async function syncCrv(ctx: AddonContext): Promise<AppliedSnapshot> {
   const snapshot = await fetchSnapshot(ctx, CRV_BASE_URLS, CRV_TOKEN_KEY, 'controle-renda-variavel');
-  const date = snapshot.data_de_referencia ?? new Date().toISOString().slice(0, 10);
-  const grouped = new Map<string, CrvHolding[]>();
-  for (const holding of snapshot.holdings ?? []) {
-    const key = `${holding.account}:${holding.portfolio}:${holding.currency}`;
-    grouped.set(key, [...(grouped.get(key) ?? []), holding]);
-  }
-  for (const [key, holdings] of grouped) {
-    const first = holdings[0];
-    const target = await findOrCreateAccount(
-      ctx,
-      `crv:${key}`,
-      `CRV · ${first.account_name} · ${first.portfolio}`,
-      first.currency,
-      'SECURITIES',
-    );
-    const positions: SnapshotHoldingInput[] = holdings.map((holding) => ({
-      symbol: holding.instrument,
-      quantity: holding.quantity,
-      currency: holding.currency,
-      averageCost: holding.average_cost,
-      quoteCcy: holding.currency,
-      exchangeMic: holding.market,
-      instrumentType: 'EQUITY',
-      dataSource: 'controle-renda-variavel',
-    }));
-    await ctx.api.snapshots.save(target.id, positions, {}, date);
-  }
-  // Holdings are still refreshed if the optional ledger endpoint is temporarily
-  // unavailable; the source is then marked stale and the next cycle retries it.
+  // The ledger endpoint is optional: if it is temporarily unavailable the source
+  // is marked stale and the next cycle retries it.
   const ledger = await fetchCrvLedger(ctx);
   const activities = await fetchCrvActivities(ctx);
   if (activities.coverage.income_included !== snapshot.income?.length) {
@@ -605,19 +571,6 @@ async function syncCrv(ctx: AddonContext): Promise<AppliedSnapshot> {
     await deleteRecordSet(ctx, `${CRV_RECORDS_KEY}.${previousCrvCacheId}.income`);
     await deleteRecordSet(ctx, `${CRV_RECORDS_KEY}.${previousCrvCacheId}.ledger`);
     await deleteRecordSet(ctx, `${CRV_RECORDS_KEY}.${previousCrvCacheId}.closed-activities`);
-  }
-  const activeSources = new Set(
-    [...grouped.keys()].map((key) => sourceAccountId(`crv:${key}`)),
-  );
-  // As with CB, absence is safe to reconcile only with an explicit complete
-  // collection declaration for the documented CRV holdings scope.
-  if (snapshot.coverage?.holdings?.complete === true) {
-    const existing = await ctx.api.accounts.getAll();
-    for (const account of existing) {
-      if (!account.meta?.startsWith(`${ACCOUNT_META_KEY}:crv:`)) continue;
-      if (activeSources.has(account.meta)) continue;
-      await ctx.api.snapshots.save(account.id, [], {}, date);
-    }
   }
   return {
     snapshotId: snapshot.snapshot_id!,
@@ -718,8 +671,9 @@ async function syncAll(ctx: AddonContext, force = false) {
 function ImportPage({ ctx }: { ctx: AddonContext }) {
   const [cbToken, setCbToken] = useState('');
   const [crvToken, setCrvToken] = useState('');
-  const [status, setStatus] = useState('Configure os tokens e importe manualmente.');
+  const [status, setStatus] = useState('Guarde os tokens: o servidor e esta tela usam os mesmos.');
   const [sourceStatuses, setSourceStatuses] = useState({ cb: emptySourceStatus(), crv: emptySourceStatus() });
+  const [serverStatuses, setServerStatuses] = useState({ cb: emptyServerStatus(), crv: emptyServerStatus() });
   const [cbRecords, setCbRecords] = useState<CachedCbRecords | null>(null);
   const [crvRecords, setCrvRecords] = useState<CachedCrvRecords | null>(null);
   const [tab, setTab] = useState<'cb' | 'income' | 'closed' | 'ledger'>('cb');
@@ -729,6 +683,10 @@ function ImportPage({ ctx }: { ctx: AddonContext }) {
     const cb = await loadSourceStatus(ctx, CB_SYNC_STATUS_KEY);
     const crv = await loadSourceStatus(ctx, CRV_SYNC_STATUS_KEY);
     setSourceStatuses({ cb, crv });
+    setServerStatuses({
+      cb: readServerStatus(await ctx.api.storage.get(`${SERVER_STATUS_KEY_PREFIX}cb`)),
+      crv: readServerStatus(await ctx.api.storage.get(`${SERVER_STATUS_KEY_PREFIX}crv`)),
+    });
     try {
   const [cbRaw, crvRaw] = await Promise.all([
         ctx.api.storage.get(CB_RECORDS_KEY),
@@ -760,21 +718,33 @@ function ImportPage({ ctx }: { ctx: AddonContext }) {
     if (cbToken) await ctx.api.secrets.set(CB_TOKEN_KEY, cbToken);
     if (crvToken) await ctx.api.secrets.set(CRV_TOKEN_KEY, crvToken);
     await ctx.api.storage.set(AUTO_SYNC_ENABLED_KEY, 'true');
-    setCbToken(''); setCrvToken(''); setStatus('Tokens guardados no cofre. A sincronização automática foi ativada.');
+    setCbToken(''); setCrvToken(''); setStatus('Tokens guardados no cofre. O servidor os usa na próxima rodada, e a atualização automática dos registros foi ativada.');
   };
   const run = async () => {
-    setStatus('Importando snapshots…');
+    setStatus('Atualizando registros…');
     try {
       await syncAll(ctx, true);
-      setStatus('Snapshots importados. Itens sem preço são identificados; cartões, aplicações e opções não entram nesta fase.');
-      ctx.api.toast.success('Controle Patrimonial atualizado');
+      setStatus('Registros atualizados. Contas e saldos são importados pelo servidor, não por esta tela.');
+      ctx.api.toast.success('Registros atualizados');
     } catch (error) {
       void error;
       setStatus('Uma ou mais fontes falharam. Confira o estado de CB e CRV abaixo e tente novamente.');
-      ctx.api.toast.error('Não foi possível importar os snapshots');
+      ctx.api.toast.error('Não foi possível atualizar os registros');
     } finally {
       await refreshSourceStatuses();
     }
+  };
+  const renderServerStatus = (name: string, server: ServerSyncStatus) => {
+    const { label, tone } = describeServerStatus(server);
+    const formatTime = (value: string | null) => value ? new Date(value).toLocaleString('pt-BR') : '—';
+    const color = tone === 'error' ? 'text-red-700' : tone === 'warn' ? 'text-amber-700' : '';
+    return <section key={`server-${name}`} className="border rounded p-3 space-y-1">
+      <h3 className={`font-semibold ${color}`}>{name}: {label}</h3>
+      <p className="text-sm">Última verificação: {formatTime(server.updatedAt)}</p>
+      <p className="text-sm">Dia importado: {server.appliedOn ?? '—'} · contas: {server.accountsImported ?? '—'} · saldos e posições gravados: {server.snapshotsImported ?? '—'}</p>
+      <p className="text-sm">Snapshot: {server.snapshotId ?? '—'} · checkpoint: {server.highWatermark ?? '—'}</p>
+      {server.error && <p className="text-sm text-red-700">{server.error}</p>}
+    </section>;
   };
   const renderSourceStatus = (name: string, source: SourceSyncStatus) => {
     const labels: Record<SourceStatusValue, string> = {
@@ -850,13 +820,17 @@ function ImportPage({ ctx }: { ctx: AddonContext }) {
   </section>;
   return <main className="p-6 max-w-none space-y-4">
     <h1 className="text-2xl font-semibold">Controle Patrimonial</h1>
-    <p>Snapshots patrimoniais e registros de origem em modo somente leitura. Lançamentos CB ficam visíveis para análise; proventos e movimentos CRV não são convertidos em caixa ou atividades.</p>
+    <p>O servidor importa contas e saldos do CB e do CRV a cada 15 minutos, sem precisar desta tela aberta; o estado dele está abaixo. Esta tela guarda uma cópia local dos registros de origem (lançamentos CB, proventos e movimentos CRV) só para consulta, sem gravar nada no Wealthfolio.</p>
     <label className="block">Token CB<input value={cbToken} onChange={(e) => setCbToken(e.target.value)} type="password" className="block border rounded p-2 w-full" /></label>
     <label className="block">Token CRV<input value={crvToken} onChange={(e) => setCrvToken(e.target.value)} type="password" className="block border rounded p-2 w-full" /></label>
     <button onClick={saveTokens} className="border rounded p-2">Guardar tokens</button>{' '}
-    <button onClick={run} className="border rounded p-2">Importar agora</button>
+    <button onClick={run} className="border rounded p-2">Atualizar registros</button>
     <p className="text-sm">{status}</p>
     <div className="space-y-3">
+      <h2 className="text-lg font-semibold">Importação no servidor (contas e saldos)</h2>
+      {renderServerStatus('CB', serverStatuses.cb)}
+      {renderServerStatus('CRV', serverStatuses.crv)}
+      <h2 className="text-lg font-semibold">Cópia local dos registros</h2>
       {renderSourceStatus('CB', sourceStatuses.cb)}
       {renderSourceStatus('CRV', sourceStatuses.crv)}
     </div>

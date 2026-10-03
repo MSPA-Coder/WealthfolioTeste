@@ -23,12 +23,12 @@ const local = JSON.parse(readFileSync('manifest.json', 'utf8'));
 const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
 const dist = readFileSync(join(dir, 'dist/addon.js'), 'utf8');
 check('conteúdo do ZIP: manifest.json, dist/addon.js, README.md', ['manifest.json', 'dist/addon.js', 'README.md'].every((f) => listing.includes(f)) && listing.length === 3, listing.join(', '));
-check(`versão ${packed.version} igual em manifest.json, package.json e no ZIP`, packed.version === '0.3.2' && local.version === packed.version && pkg.version === packed.version);
+check(`versão ${packed.version} igual em manifest.json, package.json e no ZIP`, packed.version === '0.4.0' && local.version === packed.version && pkg.version === packed.version);
 check('manifesto do ZIP idêntico ao do repositório', JSON.stringify(packed) === JSON.stringify(local));
 const perms = packed.permissions.map((p) => `${p.category}.${p.functions.join('+')}`).join(', ');
-check('permissões: accounts.getAll+create, snapshots.save, secrets.set+use, network.request', perms === 'accounts.getAll+create, snapshots.save, secrets.set+use, network.request', perms);
+check('permissões: só secrets.set+use e network.request (o add-on não escreve no Wealthfolio)', perms === 'secrets.set+use, network.request', perms);
 check('hosts declarados: host.docker.internal, cb-api, crv-api', JSON.stringify(packed.network.allowedHosts) === JSON.stringify(['host.docker.internal', 'cb-api', 'crv-api']));
-check('dist do ZIP envia isDefault:false na criação de conta', /isDefault:\s*!?1|isDefault:\s*false/.test(dist), (dist.match(/isDefault:\s*[^,\s]+/) ?? [''])[0]);
+check('dist do ZIP não chama accounts.* nem snapshots.*', !/\.accounts\.(create|getAll)|\.snapshots\.save|isDefault/.test(dist));
 check('dist não contém tokens ou segredos literais', !/Bearer [A-Za-z0-9_-]{20,}/.test(dist) && !/TEST-C/.test(dist));
 
 const fx = buildFixtures({ descriptionPad: 90 });
@@ -57,7 +57,7 @@ const st = async (k) => JSON.parse((await host.ctx.api.storage.get(k)) ?? 'null'
 const deadline = Date.now() + 60000;
 while (Date.now() < deadline && !((await st('sync.status.cb'))?.status === 'current' && (await st('sync.status.crv'))?.status === 'current')) await new Promise((r) => setTimeout(r, 100));
 check('dist do ZIP via enable(): CB e CRV ficam "current" (importação inicial automática)', (await st('sync.status.cb'))?.status === 'current' && (await st('sync.status.crv'))?.status === 'current');
-check('nenhuma criação de conta rejeitada pelo host; contas e snapshots gravados', host.calls.createRejected === 0 && host.accounts.length === 15 && host.snapshots.size === 15, `${host.accounts.length} contas, ${host.snapshots.size} snapshots`);
+check('o dist do ZIP não grava conta nem snapshot no host', host.calls.createRejected === 0 && host.accounts.length === 0 && host.snapshots.size === 0, `${host.accounts.length} contas, ${host.snapshots.size} snapshots`);
 check('rota /addons/controle-patrimonial-sync registrada', host.routesAdded.some((r) => r.path === '/addons/controle-patrimonial-sync'));
 host.disposers.forEach((f) => f());
 console.log(`\nRESUMO: ${results.filter(Boolean).length}/${results.length} verificações passaram.`);

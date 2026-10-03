@@ -34,6 +34,8 @@ services:
       WF_COOKIE_SECURE: "true"
       WF_DB_REQUIRE_ENCRYPTION: "1"
       WF_ADDON_NETWORK_PRIVATE_TARGETS: "${WF_ADDON_NETWORK_PRIVATE_TARGETS:-}"
+      # Importação do CB e do CRV pelo servidor (patch 0004), em segundos. 0 desliga.
+      WF_PATRIMONIO_SYNC_INTERVAL_SECS: "${WF_PATRIMONIO_SYNC_INTERVAL_SECS:-900}"
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8088/api/v1/healthz"]
       interval: 30s

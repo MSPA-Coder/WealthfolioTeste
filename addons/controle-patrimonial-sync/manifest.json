@@ -1,8 +1,8 @@
 {
   "id": "controle-patrimonial-sync",
   "name": "Controle Patrimonial",
-  "version": "0.3.2",
-  "description": "Imports read-only CB and CRV v4 snapshots into Wealthfolio.",
+  "version": "0.4.0",
+  "description": "Shows the server-side CB and CRV import and keeps a local read-only copy of the source records.",
   "author": "MSPA",
   "main": "dist/addon.js",
   "sdkVersion": "3.9.0",
@@ -21,8 +21,6 @@
   },
   "network": { "allowedHosts": ["host.docker.internal", "cb-api", "crv-api"] },
   "permissions": [
-    { "category": "accounts", "functions": ["getAll", "create"], "purpose": "Create and find accounts mapped from CB and CRV." },
-    { "category": "snapshots", "functions": ["save"], "purpose": "Replace the current holdings or cash snapshot idempotently." },
     { "category": "secrets", "functions": ["set", "use"], "purpose": "Store each source Bearer token in the secret vault and use it only to authenticate read-only API requests." },
     { "category": "network", "functions": ["request"], "purpose": "Read the explicitly approved local CB and CRV v4 APIs." }
   ],
