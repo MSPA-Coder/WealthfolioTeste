@@ -28,7 +28,7 @@ export function fixturesFromReal(real) {
     // cópia profunda: os cenários de falha mutam o corpo devolvido
     return structuredClone({ ...template, itens: slice, paginacao: { ...template.paginacao, pagina: page, paginas: Math.ceil(rows.length / size), tem_proxima: page * size < rows.length, total: rows.length } });
   };
-  const changes = (system) => ({ contrato: 'patrimonio/v4', recurso: 'changes', sistema: system, mode: 'snapshot_invalidation', high_watermark: 'wm-changes-' + system, next_cursor: null, has_more: false, items: [] });
+  const changes = (system) => ({ contrato: 'patrimonio/v4', recurso: 'changes', sistema: system, mode: 'snapshot_invalidation', high_watermark: 'wm-changes-' + system, next_cursor: 'wm-changes-' + system, has_more: false, items: [] });
   const count = (res) => cbSnapshot.items.filter((i) => i.resource === res).length;
   const groups = new Set(crvSnapshot.holdings.map((h) => `${h.account}:${h.portfolio}:${h.currency}`));
   return {
@@ -47,35 +47,35 @@ export function buildFixtures({ cbEntries = 1475, descriptionPad = 0 } = {}) {
   const words = ['Mercado', 'Açúcar e café', 'Aluguel "centro"', 'Conta de luz', 'Cartão C:\\loja', 'Farmácia', 'Salário', 'Transferência PIX', 'Seguro', 'Escola'];
 
   // ---------- CB ----------
-  const accountTypes = ['conta_corrente', 'conta_corrente', 'conta_corrente', 'poupanca', 'cartao_credito', 'aplicacao', 'dinheiro'];
   const accounts = Array.from({ length: 21 }, (_, i) => {
-    const type = i < 12 ? pick(['conta_corrente', 'poupanca', 'dinheiro']) : i < 16 ? 'cartao_credito' : i < 19 ? 'aplicacao' : 'conta_corrente';
+    const type = i < 12 ? 'conta' : i < 16 ? 'cartao_credito' : i < 19 ? 'aplicacao' : 'conta';
     const source_id = sid('controle-bancario:account', 50);
     return {
       resource: 'account',
       source_id,
       payload: {
-        source_id, name: `Conta ${i + 1}`, account_type: type, currency: i === 20 ? 'USD' : 'BRL',
-        owner: hex(8), owner_name: 'Titular ' + (i % 3), institution: hex(12), institution_name: 'Banco ' + (i % 5), institution_type: 'banco',
+        source_id, name: `Conta ${i + 1}`, account_type: type, purpose: i % 9 === 8 ? 'administrada' : 'pessoal', currency: i === 20 ? 'USD' : 'BRL',
+        owner: hex(8), owner_name: 'Titular ' + (i % 3), institution: hex(12), institution_name: 'Banco ' + (i % 5), institution_type: i % 5 === 4 ? 'Corretora' : 'Banco',
         initial_balance: money(), initial_balance_date: '2026-01-01',
         // duas contas sem saldo publicado: ausência não é saldo zero
         balance: i === 19 || i === 20 ? null : (i % 7 === 3 ? '-' + money() : money()),
-        balance_as_of: '2026-09-29', deep_link: `https://cb.example.invalid/contas/${hex(24)}`,
+        balance_as_of: i === 19 || i === 20 ? null : '2026-09-29', deep_link: `/banking/accounts/${i + 1}/?data=2026-09-29`,
       },
     };
   });
   const categories = Array.from({ length: 25 }, (_, i) => {
     const source_id = sid('controle-bancario:category', 51);
-    return { resource: 'category', source_id, payload: { source_id, name: `Categoria ${i + 1}`, kind: i % 4 === 0 ? 'movimento' : 'gerencial', created_at: null, updated_at: '2026-09-01T10:00:00.000000+00:00' } };
+    return { resource: 'category', source_id, payload: { source_id, name: `Categoria ${i + 1}`, kind: i % 4 === 0 ? 'movimentacao' : 'gerencial', group: i % 3 === 0 ? 'Grupo ' + (i % 5) : null, created_at: null, updated_at: '2026-09-01T10:00:00.000000+00:00' } };
   });
   const entries = Array.from({ length: cbEntries }, () => {
     const source_id = sid('controle-bancario:cash_entry', 53);
+    const status = pick(['realizado', 'vencidos', 'a_vencer']);
     return {
       resource: 'cash_entry',
       source_id,
       payload: {
         source_id, account_id: pick(accounts).source_id, category_id: pick(categories).source_id, transfer_id: null,
-        description: pick(words) + ' '.repeat(descriptionPad).replace(/ /g, 'x'), entry_type: pick(['despesa', 'receita']), status: pick(['realizado', 'vencidos', 'a_vencer']),
+        description: pick(words) + ' '.repeat(descriptionPad).replace(/ /g, 'x'), entry_type: pick(['despesa', 'receita']), status, effective_status: status,
         category_kind: 'gerencial', currency: 'BRL', planned_amount: money(), realized_amount: money(),
         due_date: day('2026-01-02', 500), realized_date: day('2026-01-02', 500), operation_type: pick(['normal', 'transferencia']),
         installment: 1, installments: 1, is_recurring: rnd() > 0.7,
@@ -88,48 +88,61 @@ export function buildFixtures({ cbEntries = 1475, descriptionPad = 0 } = {}) {
     const legCount = i === 0 ? 40 : 2; // um agrupador grande (~7,6 KB), como o maior medido
     return {
       resource: 'transfer', source_id,
-      payload: { source_id, operation_type: 'transferencia_interna', status: 'realizado', legs: Array.from({ length: legCount }, () => ({ entry_id: sid('controle-bancario:cash_entry', 53), account_id: pick(accounts).source_id, amount: money(), currency: 'BRL', date: '2026-08-10' })) },
+      payload: { source_id, operation_type: 'transferencia_interna', status: 'realizado', legs: Array.from({ length: legCount }, (_, k) => ({ cash_entry_id: sid('controle-bancario:cash_entry', 53), account_id: pick(accounts).source_id, entry_type: k % 2 === 0 ? 'despesa' : 'receita', currency: 'BRL', planned_amount: money(), realized_amount: money() })) },
     };
   });
   const cbSnapshot = {
     contrato: 'patrimonio/v4', sistema: 'controle-bancario', generated_at: '2026-09-29T17:00:00+00:00',
-    snapshot_id: 'cb-' + hex(40), high_watermark: 'wm-cb-' + hex(40), capabilities: {},
+    snapshot_id: 'cb-' + hex(40), high_watermark: 'wm-cb-' + hex(40),
+    capabilities: { snapshot: true, changes: true, resources: { account: true, cash_entry: true, category: true, transfer: true }, decimal_strings: true, read_only: true },
     coverage: {
       account: { state: 'complete', count: accounts.length },
       cash_entry: { state: 'complete', count: entries.length, due_date_from: '2026-01-02', due_date_through: '2027-05-13', statuses: ['realizado', 'vencidos', 'a_vencer'] },
       category: { state: 'complete', count: categories.length },
       transfer: { state: 'complete', unlinked_cash_entries: 0, incomplete_groups: 0, note: 'Transferências são publicadas como agrupadores.' },
+      incremental_changes: { state: 'available', endpoint: '/patrimonio/v4/changes', mode: 'snapshot_invalidation', high_watermark: 'wm-cb-changes' },
     },
     snapshot_as_of: '2026-09-29',
     items: [...accounts, ...categories, ...entries, ...transfers],
   };
 
   // ---------- CRV ----------
-  const hold = (account, portfolio, instrument, i) => ({
-    account, account_name: account === 'XP' ? 'XP' : 'Inter', average_cost: (10 + i).toFixed(4), currency: 'BRL', current_price: null,
-    deep_link: `https://crv.example.invalid/${hex(12)}`, id: hex(56), instrument, instrument_type: 'equity', market: 'B3',
-    market_value: null, portfolio, price_kind: 'none', price_observed_at: null, price_status: 'absent', quantity: String(100 + i * 10), side: 'long',
-    snapshot_id: 'crv-snap', source_id: sid('controle-renda-variavel:holding', 56), titular: 'Titular 1', valuation_method: 'quantity_x_average_cost',
-  });
+  const hold = (account, portfolio, instrument, i) => {
+    const source_id = sid('controle-renda-variavel:holding', 56);
+    return {
+      account, account_name: account === 'XP' ? 'XP' : 'Inter', average_cost: (10 + i).toFixed(4), currency: 'BRL', current_price: null,
+      deep_link: `/positions/${i + 1}`, id: source_id, instrument, instrument_type: 'equity', market: 'B3',
+      market_value: null, portfolio, price_kind: 'unavailable', price_observed_at: null, price_status: null, quantity: String(100 + i * 10), side: 'long',
+      snapshot_id: 'crv-snap', source_id, titular: 'Titular 1', valuation_method: 'unavailable_no_price',
+    };
+  };
   const holdings = [
     ...['AAAA3', 'BBBB4', 'CCCC3', 'DDDD4'].map((s, i) => hold('XP', 'PF1', s, i)),
     ...['EEEE3', 'FFFF4', 'GGGG3'].map((s, i) => hold('INTER', 'PF1', s, 4 + i)),
     ...['HHHH3', 'IIII4', 'JJJJ3'].map((s, i) => hold('INTER', 'PF2', s, 7 + i)),
   ];
-  const income = Array.from({ length: 112 }, (_, i) => ({
-    account: 'XP', account_name: 'XP', amount: money(), cash_accounting_role: 'not_a_cash_entry', currency: 'BRL', date: day('2025-01-02', 600),
-    deep_link: `https://crv.example.invalid/p/${hex(19)}`, duplicate_risk: 'pode_ja_constar_como_caixa_no_cb_nao_somar', id: hex(55), instrument: pick(['AAAA3', 'BBBB4', 'CCCC3']),
-    kind: pick(['dividendo', 'jcp', 'rendimento']), role: 'analytic_only', snapshot_id: 'crv-snap', source_id: sid('controle-renda-variavel:income', 55), titular: 'Titular 1',
-  }));
+  const income = Array.from({ length: 112 }, (_, i) => {
+    const source_id = sid('controle-renda-variavel:income', 55);
+    return {
+      account: 'XP', account_name: 'XP', amount: money(), cash_accounting_role: 'not_a_cash_entry', currency: 'BRL', date: day('2025-01-02', 600),
+      deep_link: `/dividends/${i + 1}/edit`, duplicate_risk: 'may_also_be_recorded_in_controle_bancario', id: source_id, instrument: pick(['AAAA3', 'BBBB4', 'CCCC3']),
+      kind: pick(['dividendo', 'jcp', 'aluguel']), role: 'analytic_only', snapshot_id: 'crv-snap', source_id, titular: 'Titular 1',
+    };
+  });
   const crvSnapshot = {
-    accounts: [], capacidades: {}, contrato: 'patrimonio/v4', sistema: 'controle-renda-variavel', recurso: 'snapshot',
+    accounts: [], contrato: 'patrimonio/v4', sistema: 'controle-renda-variavel', recurso: 'snapshot',
+    capacidades: { holdings: true, position_ledger: true, income: true, activities: true, prices: true, options: false, complete_trades: false, changes: true },
     coverage: {
-      activities: { available: true }, changes: { available: true, high_watermark: 'wm-crv', mode: 'snapshot_invalidation' },
-      complete_trades: { available: false }, exclusions: { excluded_options: 5, excluded_simulated: 10 },
-      holdings: { complete: true, included: holdings.length }, income: { included: income.length, scope: 'proventos persistidos', role: 'analytic_only', do_not_rebook_as_cash: true },
+      activities: { available: true }, changes: { available: true, endpoint: '/patrimonio/v4/changes', high_watermark: 'wm-crv', mode: 'snapshot_invalidation' },
+      complete_trades: { available: false }, exclusions: { unpriced_holdings: holdings.length, excluded_options: 5, excluded_simulated: 10 },
+      holdings: { complete: true, included: holdings.length, unpriced: holdings.length, scope: 'posições abertas de ações em carteiras reais' },
+      income: { included: income.length, scope: 'proventos persistidos', role: 'analytic_only', do_not_rebook_as_cash: true },
+      prices: { current_included: 0, history_included: 0, complete: false, omitted: 'consumer_requested' },
+      options: { available: false, excluded_options: 5, excluded_simulated: 0 },
     },
     data_de_referencia: '2026-09-29', generated_at: '2026-09-29T17:00:00+00:00', gerado_em: '2026-09-29T17:00:00+00:00',
-    high_watermark: 'wm-crv-' + hex(40), holdings, income, prices: [], snapshot_id: 'crv-' + hex(40), source_id: 'crv',
+    high_watermark: 'wm-crv-' + hex(40), holdings, income, prices: { current: [], history: [] }, snapshot_id: 'crv-' + hex(40),
+    source_id: 'controle-renda-variavel:source:' + hex(24),
   };
   const ledger = { contrato: 'patrimonio/v4', coverage: { backfill: false, completeness: 'prospective', scope: 'posições encerradas após a revisão 20260928_0024', since_revision: '20260928_0024' }, estado: 'ok', gerado_em: '2026-09-29T17:00:00+00:00', itens: [], paginacao: { anterior: null, pagina: 1, paginas: 0, proxima: null, tamanho: 100, tem_anterior: false, tem_proxima: false, total: 0 }, recurso: 'ledger', sistema: 'controle-renda-variavel' };
   const activityRows = [
@@ -144,7 +157,7 @@ export function buildFixtures({ cbEntries = 1475, descriptionPad = 0 } = {}) {
       paginacao: { anterior: null, pagina: page, paginas: Math.ceil(activityRows.length / size), proxima: null, tamanho: size, tem_anterior: page > 1, tem_proxima: page * size < activityRows.length, total: activityRows.length },
     };
   };
-  const changes = (system) => ({ contrato: 'patrimonio/v4', recurso: 'changes', sistema: system, mode: 'snapshot_invalidation', high_watermark: 'wm-changes-' + system, next_cursor: null, has_more: false, items: [] });
+  const changes = (system) => ({ contrato: 'patrimonio/v4', recurso: 'changes', sistema: system, mode: 'snapshot_invalidation', high_watermark: 'wm-changes-' + system, next_cursor: 'wm-changes-' + system, has_more: false, items: [] });
 
   return { cbSnapshot, crvSnapshot, ledger, activitiesPage, changes, expected: { cbAccounts: 21, cbCategories: 25, cbEntries: cbEntries, cbTransfers: 92, crvIncome: 112, crvClosed: 6, crvLedger: 0, crvHoldings: 10, crvAccountGroups: 3 } };
 }

@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build } from 'esbuild';
 import { createHost } from './host.mjs';
 import { buildFixtures, fixturesFromReal } from './fixtures.mjs';
+import { validar } from './contrato.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const manifest = JSON.parse(readFileSync(join(root, 'manifest.json'), 'utf8'));
@@ -56,6 +57,33 @@ const bodies = {
   crvSnapshot: JSON.stringify(fx.crvSnapshot),
 };
 const clone = (o) => JSON.parse(JSON.stringify(o));
+
+// Contrato — o que alimenta a simulação cumpre o JSON Schema do v4 (cópia da canônica
+// em manutencao/docs/contratos/). No modo sintético isso garante que as fixtures
+// falam o vocabulário real; no modo real (SIM_REAL=1), que a PRODUÇÃO cumpre o contrato.
+// As mensagens trazem só o caminho do campo e a regra, nunca o valor.
+for (const [nome, corpo] of [
+  ['cb_snapshot', fx.cbSnapshot],
+  ['crv_snapshot', fx.crvSnapshot],
+  ['cb_changes', fx.changes('controle-bancario')],
+  ['crv_changes', fx.changes('controle-renda-variavel')],
+]) {
+  const r = validar(nome, corpo);
+  check('contrato', `${nome} cumpre o JSON Schema do v4`, r.ok, r.erros.join(' | '));
+}
+{
+  // Sem mutações um schema frouxo demais passaria sem ninguém notar.
+  const semEffective = clone(fx.cbSnapshot);
+  const entrada = semEffective.items.find((i) => i.resource === 'cash_entry');
+  if (entrada) delete entrada.payload.effective_status;
+  const comFloat = clone(fx.crvSnapshot);
+  if (comFloat.holdings[0]) comFloat.holdings[0].quantity = 100;
+  const semCobertura = clone(fx.crvSnapshot);
+  delete semCobertura.coverage.holdings.complete;
+  check('contrato', 'o schema reprova um lançamento sem effective_status', !validar('cb_snapshot', semEffective).ok);
+  check('contrato', 'o schema reprova quantidade como número JSON', !validar('crv_snapshot', comFloat).ok);
+  check('contrato', 'o schema reprova snapshot do CRV sem coverage.holdings.complete', !validar('crv_snapshot', semCobertura).ok);
+}
 
 function makeRoutes(faults = {}) {
   const seen = { cb: [], crv: [] };
