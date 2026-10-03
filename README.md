@@ -171,6 +171,26 @@ Para subir de versão, troque `WEALTHFOLIO_COMMIT` pelo commit da tag nova,
 confira que os patches ainda aplicam e compare as etapas do `Dockerfile` com
 as do upstream nessa tag.
 
+### Implantar uma mudança de patch no VPS
+
+O `deploy.sh wealthfolio` responde "Nada a fazer" quando o `main` já está
+implantado, e não aplica patches por conta própria. Com o `Dockerfile` deste
+repositório isso deixa de importar: o patch entra no build pelo próprio
+`docker compose`, sem checkout intermediário. Na ordem:
+
+1. Mesclar o PR no `main` (a CI já provou que a cadeia compila e a imagem sobe).
+2. No VPS, em `~/apps/wealthfolio-teste`: `git pull --ff-only`.
+3. `~/backup-db.sh --forcar` (copia o volume com o contêiner pausado por segundos).
+4. `docker compose --env-file .env -f compose.yaml -f compose.patrimonio-internal.yaml up -d --build`. A compilação do servidor leva de 30 a 60 minutos.
+5. Conferir `/api/v1/healthz` e `docker inspect` (contêiner `healthy`).
+
+Dois cuidados que custaram caro: o Wealthfolio não atualiza o MIC de um ativo
+que já existe, então mudar o MIC cria ativos novos e os antigos ficam sem
+posição (a limpeza é pela tela); e, enquanto o add-on for anterior à 0.4.0, a
+sincronização da tela passa por ele, não pelo servidor, então uma correção de
+dados costuma precisar do patch e de uma nova versão do add-on, instalada em
+**Settings > Addons**.
+
 ## Backup
 
 No VPS, o rótulo `mspa.backup.volume: /data` do `compose.yaml` coloca o volume
