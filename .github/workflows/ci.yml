@@ -7,6 +7,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Semanal, só para conferir que o schema do contrato v4 daqui é igual ao
+  # canônico (ver o passo abaixo). Os minutos da CI de repositório privado contam,
+  # então é a única rodada agendada deste workflow.
+  schedule:
+    - cron: "31 4 * * 2"
 
 permissions:
   contents: read
@@ -22,6 +27,16 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # O contrato patrimonio/v4 tem uma cópia canônica em
+      # manutencao/docs/contratos/, e a daqui (addons/.../sim/contrato/) tem de ser
+      # idêntica. Só na rodada semanal: depende da rede, e uma indisponibilidade do
+      # GitHub não deve travar um PR.
+      - name: Conferir que o schema do v4 é igual ao canônico
+        if: github.event_name == 'schedule'
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/MSPA-Coder/manutencao/main/docs/contratos/patrimonio-v4.schema.json" -o "$RUNNER_TEMP/canonico.json"
+          diff -u "$RUNNER_TEMP/canonico.json" addons/controle-patrimonial-sync/sim/contrato/patrimonio-v4.schema.json
 
       # O mesmo que o estágio `fonte` do Dockerfile faz, em segundos: o commit
       # vem do próprio Dockerfile, e os patches entram na ordem do nome, sem

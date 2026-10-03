@@ -30,6 +30,26 @@ conector do Wealthfolio grava o checkpoint apenas depois de aplicar um lote.
   `coverage.holdings.complete: true`, cujo escopo continua limitado a posições
   abertas de ações em carteiras reais.
 
+## Schema
+
+O contrato tem um JSON Schema, `patrimonio-v4.schema.json`, com uma definição por
+fonte e endpoint: `cb_metadata`, `cb_snapshot`, `cb_changes`, `crv_metadata`,
+`crv_snapshot` e `crv_changes`. A **cópia canônica** fica em
+[`manutencao/docs/contratos/`](https://github.com/MSPA-Coder/manutencao/tree/main/docs/contratos);
+as cópias nos repositórios dos publicadores (`tests/contrato/` no CB e no CRV) e
+neste (`addons/controle-patrimonial-sync/sim/contrato/`) são idênticas, e o CI de
+cada um confere isso toda semana. Para mudar o contrato, mude a canônica e copie
+para todos na mesma mudança.
+
+O schema exige os campos que os publicadores emitem hoje, com o tipo e o formato
+de hoje (valor como texto decimal, data e instante ISO 8601, moeda ISO 4217, ids
+prefixados pela fonte), e **permite propriedades a mais**: um acréscimo opcional
+não muda a versão do contrato, e quem não o conhece o ignora. Quem renomear ou
+remover um campo, ou trocar o tipo dele, reprova a suíte de quem fez a mudança.
+Cada suíte valida a saída real (CB e CRV) ou a fixture (a simulação do add-on),
+e a simulação com `SIM_REAL=1` valida as respostas de produção; as mensagens
+trazem só o caminho do campo, nunca o valor.
+
 ## Recursos
 
 | Fonte | Recursos | Semântica de importação |
