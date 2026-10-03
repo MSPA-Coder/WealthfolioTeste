@@ -1,0 +1,13 @@
+ .claude/skills/frontend-design         |    0
+ .githooks/pre-push                     |    0
+ apps/server/README.md                  |  240 +--
+ apps/server/src/api.rs                 |  770 ++++-----
+ apps/server/src/api/patrimonio_sync.rs |  563 +++++++
+ apps/tauri/gen/android/gradlew         |    0
+ apps/tauri/gen/android/gradlew.bat     |    0
+ compose.yml                            |  200 +--
+ crates/core/src/addons/network.rs      | 1324 +++++++++------
+ docs/addons/addon-api-reference.md     | 2831 ++++++++++++++++----------------
+ packages/addon-dev-tools/cli.js        |    0
+ scripts/ci-check.sh                    |    0
+ 12 files changed, 3378 insertions(+), 2550 deletions(-)
