@@ -107,7 +107,7 @@ export function buildFixtures({ cbEntries = 1475, descriptionPad = 0 } = {}) {
   // ---------- CRV ----------
   const hold = (account, portfolio, instrument, i) => ({
     account, account_name: account === 'XP' ? 'XP' : 'Inter', average_cost: (10 + i).toFixed(4), currency: 'BRL', current_price: null,
-    deep_link: `https://crv.example.invalid/${hex(12)}`, id: hex(56), instrument, instrument_type: 'equity', market: 'BR',
+    deep_link: `https://crv.example.invalid/${hex(12)}`, id: hex(56), instrument, instrument_type: 'equity', market: 'B3',
     market_value: null, portfolio, price_kind: 'none', price_observed_at: null, price_status: 'absent', quantity: String(100 + i * 10), side: 'long',
     snapshot_id: 'crv-snap', source_id: sid('controle-renda-variavel:holding', 56), titular: 'Titular 1', valuation_method: 'quantity_x_average_cost',
   });
