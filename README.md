@@ -117,6 +117,7 @@ build.
 | `0001-patrimonio-server-sync` | Sincronização dos snapshots v4 do CB e do CRV no servidor, pela rede Docker interna e com os segredos cifrados do add-on. |
 | `0002-patrimonio-sync-runtime-fixes` | Correções de transporte interno e de criação de snapshots. |
 | `0003-fix-patrimonio-account-id-linkage` | Vínculo do id da conta entre o snapshot e a conta criada. |
+| `0004-crv-market-to-mic` | Traduz o mercado do CRV (`B3`, `NYSE`, `NASDAQ`) para o MIC que o Wealthfolio usa para achar o sufixo do Yahoo (`BVMF`, `XNYS`, `XNAS`). Sem isso, as ações da B3 pediam o ticker puro e davam 404. |
 
 Até 03/10/2026 o build usava `../CodexTemp/wealthfolio-v3.9.1`, uma cópia do
 upstream com os patches aplicados à mão. O 0000 só existia lá. Upstream mais
@@ -137,7 +138,7 @@ git checkout <WEALTHFOLIO_COMMIT>
 for p in ../WealthfolioTeste/patches/*.patch; do git apply "$p"; done
 git add -A && git commit -qm "patches atuais"
 # edite e teste com cargo test; depois:
-git diff > ../WealthfolioTeste/patches/0004-<nome>.patch
+git diff > ../WealthfolioTeste/patches/0005-<nome>.patch
 ```
 
 Para subir de versão, troque `WEALTHFOLIO_COMMIT` pelo commit da tag nova,
