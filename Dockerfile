@@ -85,6 +85,11 @@ RUN xx-cargo build --locked --release --manifest-path apps/server/Cargo.toml && 
 # Testes do upstream nos dois módulos que os patches mexem, com o mesmo
 # toolchain do build. Fora da imagem: a CI roda `docker build --target testes .`.
 FROM backend AS testes
+# Os testes do upstream incluem, na compilação, arquivos de fora dos crates: as
+# fixtures de contabilidade (`tests/fixtures`) e o `index.html` do front-end. A
+# imagem final não os leva, então só este estágio os copia.
+COPY --from=fonte /src/tests ./tests
+COPY --from=fonte /src/apps/frontend/index.html ./apps/frontend/index.html
 RUN xx-cargo test --locked --release -p wealthfolio-core --lib addons::network \
  && xx-cargo test --locked --release -p wealthfolio-server --lib patrimonio_sync
 
