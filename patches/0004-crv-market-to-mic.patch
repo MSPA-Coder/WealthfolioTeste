@@ -1,0 +1,56 @@
+diff --git a/apps/server/src/api/patrimonio_sync.rs b/apps/server/src/api/patrimonio_sync.rs
+index e1fc47c..29a256e 100644
+--- a/apps/server/src/api/patrimonio_sync.rs
++++ b/apps/server/src/api/patrimonio_sync.rs
+@@ -317,13 +317,15 @@ async fn sync_crv_holdings(
+         };
+         let symbol = required_string(holding, "instrument", "instrumento CRV")?;
+         let currency = required_string(holding, "currency", "moeda da posição CRV")?;
+-        let instrument_key = format!("{}:{}:{}", holding.get("market").and_then(Value::as_str).unwrap_or_default(), symbol, currency);
++        let market = holding.get("market").and_then(Value::as_str).unwrap_or_default();
++        let exchange_mic = market_to_mic(market);
++        let instrument_key = format!("{}:{}:{}", exchange_mic, symbol, currency);
+         let quantity = parse_decimal_field(holding, "quantity", "quantidade CRV")?;
+         let average_cost = parse_decimal_field(holding, "average_cost", "custo médio CRV")?;
+         positions_by_account.entry(account_id).or_default().push(ManualHoldingInput {
+             asset_id: Some(stable_id("crv-asset", &instrument_key)),
+             symbol: symbol.to_string(),
+-            exchange_mic: holding.get("market").and_then(Value::as_str).map(str::to_string),
++            exchange_mic: Some(exchange_mic.to_string()),
+             quantity, currency: currency.to_string(), average_cost, name: None,
+             data_source: None, asset_kind: None, quote_ccy: Some(currency.to_string()),
+             instrument_type: Some("EQUITY".into()), provider_id: None, provider_symbol: None,
+@@ -437,6 +439,18 @@ async fn save_source_snapshot(
+     Ok(())
+ }
+ 
++/// O CRV nomeia o mercado ("B3", "NYSE", "NASDAQ"); o Wealthfolio espera o MIC
++/// (ISO 10383). Sem o MIC, o resolvedor de cotações não acha o sufixo do Yahoo
++/// (`.SA` para a B3) e pede o ticker puro, que o Yahoo recusa com 404.
++fn market_to_mic(market: &str) -> &str {
++    match market {
++        "B3" => "BVMF",
++        "NYSE" => "XNYS",
++        "NASDAQ" => "XNAS",
++        other => other,
++    }
++}
++
+ fn stable_id(prefix: &str, source_id: &str) -> String {
+     let digest = Sha256::digest(source_id.as_bytes());
+     let encoded = digest
+@@ -550,6 +564,14 @@ mod tests {
+         assert!(validate_contract(&serde_json::json!({"contrato": "patrimonio/v3"})).is_err());
+     }
+ 
++    #[test]
++    fn crv_markets_map_to_the_mic_the_quote_resolver_knows() {
++        assert_eq!(market_to_mic("B3"), "BVMF");
++        assert_eq!(market_to_mic("NYSE"), "XNYS");
++        assert_eq!(market_to_mic("NASDAQ"), "XNAS");
++        assert_eq!(market_to_mic("XLON"), "XLON");
++    }
++
+     #[test]
+     fn source_urls_use_the_internal_aliases_and_v4_path() {
+         assert_eq!(CB_BASE_URL, "http://cb-api:8000/patrimonio/v4");
