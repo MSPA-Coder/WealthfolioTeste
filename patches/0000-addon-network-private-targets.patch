@@ -1,0 +1,433 @@
+Extensão do broker de rede dos add-ons: alvos locais exatos e só leitura.
+
+O Wealthfolio 3.9.1 recusa qualquer endereço privado no broker de rede dos
+add-ons ("Addon network host resolves to a private address"). O add-on e a
+sincronização do servidor (0001) leem o CB e o CRV pela rede Docker interna
+(cb-api, crv-api), então precisam desta exceção.
+
+WF_ADDON_NETWORK_PRIVATE_TARGETS lista URLs exatas http://host:porta/patrimonio/v4.
+Cada uma libera só GET nessa origem e nesse caminho (ou abaixo dele), com o host
+declarado literalmente no add-on, endereço resolvido privado e sem proxy. Sem a
+variável, nada muda em relação ao upstream.
+
+Esta extensão existia só na pasta CodexTemp do VPS1. Foi extraída em 03/10/2026
+pela diferença entre o CodexTemp e o upstream v3.9.1 (392f272), descontados os
+patches 0001 a 0003. Vem antes deles porque o 0001 comenta a mesma variável no
+compose.yml.
+
+diff --git a/compose.yml b/compose.yml
+index 4428794..acb6829 100644
+--- a/compose.yml
++++ b/compose.yml
+@@ -24,6 +24,8 @@ services:
+       WF_SECRET_KEY_FILE: "${WF_SECRET_KEY_FILE:-}"
+       # Startup requirement; convert existing databases offline before enabling.
+       WF_DB_REQUIRE_ENCRYPTION: "${WF_DB_REQUIRE_ENCRYPTION:-0}"
++      # Optional exact local read-only addon API targets; unset keeps private hosts blocked.
++      WF_ADDON_NETWORK_PRIVATE_TARGETS: "${WF_ADDON_NETWORK_PRIVATE_TARGETS:-}"
+ 
+       # ── Authentication ────────────────────────────────────────────────
+       # Required when listening on 0.0.0.0 (the default for Docker).
+diff --git a/crates/core/src/addons/network.rs b/crates/core/src/addons/network.rs
+index a21f50b..2c57522 100644
+--- a/crates/core/src/addons/network.rs
++++ b/crates/core/src/addons/network.rs
+@@ -19,6 +19,15 @@ const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+ const MAX_RESPONSE_BODY_BYTES: usize = 2 * 1024 * 1024;
+ const REQUEST_TIMEOUT_SECS: u64 = 10;
+ const MAX_REQUEST_TIMEOUT_SECS: u64 = 120;
++const PRIVATE_TARGETS_ENV: &str = "WF_ADDON_NETWORK_PRIVATE_TARGETS";
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++struct AddonNetworkPrivateTarget {
++    scheme: String,
++    host: String,
++    port: u16,
++    path_prefix: String,
++}
+ 
+ fn validate_addon_runtime_id(addon_id: &str) -> Result<(), String> {
+     validate_addon_id(&addon_id.to_ascii_lowercase())
+@@ -62,19 +71,27 @@ pub async fn perform_addon_network_request(
+ ) -> Result<AddonNetworkResponse, String> {
+     validate_addon_runtime_id(addon_id)?;
+     let timeout_secs = resolve_request_timeout_secs(request.timeout_secs)?;
+-    let url = validate_url(&request.url, allowed_hosts)?;
++    let private_targets = configured_private_targets()?;
++    let (url, is_private_target) = validate_url(&request.url, allowed_hosts, &private_targets)?;
+     let host = url
+         .host_str()
+         .ok_or_else(|| "Addon network URL must include a host".to_string())?
+         .to_string();
+-    let resolved_addresses = resolve_public_addresses(&url).await?;
+-    let method = validate_method(request.method.as_deref().unwrap_or("GET"))?;
++    let method = validate_method_for_target(
++        request.method.as_deref().unwrap_or("GET"),
++        is_private_target,
++    )?;
++    let resolved_addresses = resolve_addresses(&url, is_private_target).await?;
+     let body = request.body.unwrap_or_default();
+     if body.len() > MAX_REQUEST_BODY_BYTES {
+         return Err("Addon network request body is too large".to_string());
+     }
+ 
+-    let client = addon_network_client_builder(&host, &resolved_addresses, timeout_secs)
++    let mut client_builder = addon_network_client_builder(&host, &resolved_addresses, timeout_secs);
++    if is_private_target {
++        client_builder = client_builder.no_proxy();
++    }
++    let client = client_builder
+         .build()
+         .map_err(|e| e.to_string())?;
+ 
+@@ -184,9 +201,27 @@ fn resolve_request_timeout_secs(timeout_secs: Option<u64>) -> Result<u64, String
+     }
+ }
+ 
+-fn validate_url(url: &str, allowed_hosts: &[String]) -> Result<Url, String> {
++fn validate_url(
++    url: &str,
++    allowed_hosts: &[String],
++    private_targets: &[AddonNetworkPrivateTarget],
++) -> Result<(Url, bool), String> {
+     let parsed = Url::parse(url).map_err(|_| "Invalid addon network URL".to_string())?;
+-    if parsed.scheme() != "https" {
++    let host = parsed
++        .host_str()
++        .ok_or_else(|| "Addon network URL must include a host".to_string())?
++        .to_ascii_lowercase();
++    let port = parsed
++        .port_or_known_default()
++        .ok_or_else(|| "Addon network URL must include a port".to_string())?;
++    let is_private_target = private_targets.iter().any(|target| {
++        target.scheme == parsed.scheme()
++            && target.port == port
++            && target_matches_host(target, &host)
++            && private_target_path_matches(parsed.path(), &target.path_prefix)
++    });
++
++    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && is_private_target) {
+         return Err("Addon network requests must use HTTPS".to_string());
+     }
+ 
+@@ -194,12 +229,7 @@ fn validate_url(url: &str, allowed_hosts: &[String]) -> Result<Url, String> {
+         return Err("Addon network URLs cannot include credentials".to_string());
+     }
+ 
+-    let host = parsed
+-        .host_str()
+-        .ok_or_else(|| "Addon network URL must include a host".to_string())?
+-        .to_ascii_lowercase();
+-
+-    if is_blocked_host(&host) {
++    if is_blocked_host(&host) && !is_private_target {
+         return Err("Addon network host is not allowed".to_string());
+     }
+ 
+@@ -209,8 +239,121 @@ fn validate_url(url: &str, allowed_hosts: &[String]) -> Result<Url, String> {
+     {
+         return Err(format!("Addon network host '{host}' is not approved"));
+     }
++    if is_private_target
++        && !allowed_hosts
++            .iter()
++            .any(|allowed| normalize_host(allowed) == host)
++    {
++        return Err(
++            "Addon local network hosts must be declared literally; wildcards are not allowed"
++                .to_string(),
++        );
++    }
+ 
+-    Ok(parsed)
++    Ok((parsed, is_private_target))
++}
++
++fn configured_private_targets() -> Result<Vec<AddonNetworkPrivateTarget>, String> {
++    match std::env::var(PRIVATE_TARGETS_ENV) {
++        Ok(configured) => parse_private_targets(&configured),
++        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
++        Err(std::env::VarError::NotUnicode(_)) => {
++            Err(format!("{PRIVATE_TARGETS_ENV} must contain valid UTF-8"))
++        }
++    }
++}
++
++fn parse_private_targets(configured: &str) -> Result<Vec<AddonNetworkPrivateTarget>, String> {
++    let mut targets = Vec::new();
++    for entry in configured
++        .split(',')
++        .map(str::trim)
++        .filter(|entry| !entry.is_empty())
++    {
++        let parsed = Url::parse(entry)
++            .map_err(|_| {
++                format!(
++                    "Invalid {PRIVATE_TARGETS_ENV} entry; expected http://host:port/patrimonio/v4"
++                )
++            })?;
++        let raw_authority = entry
++            .split_once("//")
++            .map(|(_, authority)| authority)
++            .unwrap_or_default()
++            .split(['/', '?', '#'])
++            .next()
++            .unwrap_or_default();
++        let explicit_port = if raw_authority.starts_with('[') {
++            raw_authority
++                .split_once(']')
++                .and_then(|(_, suffix)| suffix.strip_prefix(':'))
++        } else {
++            raw_authority
++                .rsplit_once(':')
++                .map(|(_, port)| port)
++        };
++        let port = explicit_port
++            .and_then(|port| port.parse::<u16>().ok())
++            .filter(|port| *port != 0)
++            .ok_or_else(|| {
++                format!(
++                    "Invalid {PRIVATE_TARGETS_ENV} entry; expected http://host:port/patrimonio/v4"
++                )
++            })?;
++        let host = parsed
++            .host_str()
++            .ok_or_else(|| {
++                format!(
++                    "Invalid {PRIVATE_TARGETS_ENV} entry; expected http://host:port/patrimonio/v4"
++                )
++            })?;
++        if parsed.username() != ""
++            || parsed.password().is_some()
++            || parsed.scheme() != "http"
++            || parsed.path() != "/patrimonio/v4"
++            || parsed.query().is_some()
++            || parsed.fragment().is_some()
++            || parsed.port_or_known_default() != Some(port)
++            || host.contains('*')
++            || host.trim_matches(['[', ']']).is_empty()
++        {
++            return Err(format!(
++                "Invalid {PRIVATE_TARGETS_ENV} entry; expected http://host:port/patrimonio/v4"
++            ));
++        }
++
++        let host = normalize_host(host);
++        let target = AddonNetworkPrivateTarget {
++            scheme: parsed.scheme().to_string(),
++            host,
++            port,
++            path_prefix: parsed.path().to_string(),
++        };
++        if !targets.contains(&target) {
++            targets.push(target);
++        }
++    }
++    Ok(targets)
++}
++
++fn target_matches_host(target: &AddonNetworkPrivateTarget, host: &str) -> bool {
++    target.host == normalize_host(host)
++}
++
++fn private_target_path_matches(path: &str, prefix: &str) -> bool {
++    if path.contains('%') || path.contains('\\') {
++        return false;
++    }
++    path == prefix
++        || path
++            .strip_prefix(prefix)
++            .is_some_and(|suffix| suffix.starts_with('/'))
++}
++
++fn normalize_host(host: &str) -> String {
++    host.trim_matches(['[', ']'])
++        .trim_end_matches('.')
++        .to_ascii_lowercase()
+ }
+ 
+ fn validate_method(method: &str) -> Result<Method, String> {
+@@ -274,7 +417,24 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
+     }
+ }
+ 
+-async fn resolve_public_addresses(url: &Url) -> Result<Vec<SocketAddr>, String> {
++fn validate_method_for_target(method: &str, is_private_target: bool) -> Result<Method, String> {
++    let method = validate_method(method)?;
++    if is_private_target && method != Method::GET {
++        return Err("Addon local network requests only allow GET".to_string());
++    }
++    Ok(method)
++}
++
++fn is_local_network_ip(ip: IpAddr) -> bool {
++    match ip {
++        IpAddr::V4(ip) => {
++            (ip.is_private() || ip.is_loopback()) && ip.octets() != [169, 254, 169, 254]
++        }
++        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
++    }
++}
++
++async fn resolve_addresses(url: &Url, allow_private: bool) -> Result<Vec<SocketAddr>, String> {
+     let host = url
+         .host_str()
+         .ok_or_else(|| "Addon network URL must include a host".to_string())?;
+@@ -283,9 +443,12 @@ async fn resolve_public_addresses(url: &Url) -> Result<Vec<SocketAddr>, String>
+         .ok_or_else(|| "Addon network URL must include a port".to_string())?;
+ 
+     if let Ok(ip) = parse_ip_host(host) {
+-        if is_blocked_ip(ip) {
++        if is_blocked_ip(ip) && !allow_private {
+             return Err("Addon network host resolves to a private address".to_string());
+         }
++        if allow_private && !is_local_network_ip(ip) {
++            return Err("Addon local network host resolves to a public address".to_string());
++        }
+         return Ok(vec![SocketAddr::new(ip, port)]);
+     }
+ 
+@@ -295,9 +458,12 @@ async fn resolve_public_addresses(url: &Url) -> Result<Vec<SocketAddr>, String>
+ 
+     let mut resolved = Vec::new();
+     for address in addresses {
+-        if is_blocked_ip(address.ip()) {
++        if is_blocked_ip(address.ip()) && !allow_private {
+             return Err("Addon network host resolves to a private address".to_string());
+         }
++        if allow_private && !is_local_network_ip(address.ip()) {
++            return Err("Addon local network host resolves to a public address".to_string());
++        }
+         resolved.push(address);
+     }
+ 
+@@ -484,13 +650,81 @@ mod tests {
+ 
+     #[test]
+     fn validates_allowed_hosts() {
+-        assert!(validate_url("https://api.example.com/v1", &["api.example.com".into()]).is_ok());
+-        assert!(validate_url("https://x.example.com/v1", &["*.example.com".into()]).is_ok());
+-        assert!(validate_url("https://example.com/v1", &["*.example.com".into()]).is_err());
+-        assert!(validate_url("http://api.example.com/v1", &["api.example.com".into()]).is_err());
+-        assert!(validate_url("https://127.0.0.1/v1", &["127.0.0.1".into()]).is_err());
+-        assert!(validate_url("https://[::1]/v1", &["::1".into()]).is_err());
+-        assert!(validate_url("https://localhost/v1", &["localhost".into()]).is_err());
++        let no_private_targets = [];
++        assert!(validate_url(
++            "https://api.example.com/v1",
++            &["api.example.com".into()],
++            &no_private_targets
++        )
++        .is_ok());
++        assert!(validate_url(
++            "https://x.example.com/v1",
++            &["*.example.com".into()],
++            &no_private_targets
++        )
++        .is_ok());
++        assert!(validate_url(
++            "https://example.com/v1",
++            &["*.example.com".into()],
++            &no_private_targets
++        )
++        .is_err());
++        assert!(validate_url(
++            "http://api.example.com/v1",
++            &["api.example.com".into()],
++            &no_private_targets
++        )
++        .is_err());
++        assert!(validate_url(
++            "https://127.0.0.1/v1",
++            &["127.0.0.1".into()],
++            &no_private_targets
++        )
++        .is_err());
++        assert!(validate_url(
++            "https://[::1]/v1",
++            &["::1".into()],
++            &no_private_targets
++        )
++        .is_err());
++        assert!(validate_url(
++            "https://localhost/v1",
++            &["localhost".into()],
++            &no_private_targets
++        )
++        .is_err());
++    }
++
++    #[test]
++    fn local_targets_are_restricted_to_exact_http_origin_and_api_path() {
++        let targets = parse_private_targets(
++            "http://host.docker.internal:5201/patrimonio/v4,http://host.docker.internal:5301/patrimonio/v4",
++        )
++        .unwrap();
++        let allowed_hosts = ["host.docker.internal".into()];
++        for url in [
++            "http://host.docker.internal:5201/patrimonio/v4/snapshot",
++            "http://host.docker.internal:5201/patrimonio/v4/metadata",
++            "http://host.docker.internal:5301/patrimonio/v4/activities?cursor=abc",
++        ] {
++            assert!(validate_url(url, &allowed_hosts, &targets).unwrap().1);
++        }
++        for url in [
++            "http://host.docker.internal:5202/patrimonio/v4/snapshot",
++            "https://host.docker.internal:5201/patrimonio/v4/snapshot",
++            "http://host.docker.internal:5201/other",
++            "http://host.docker.internal:5201/patrimonio/v40/snapshot",
++            "http://host.docker.internal:5201/patrimonio/v4%2fsnapshot",
++            "http://other.internal:5201/patrimonio/v4/snapshot",
++        ] {
++            assert!(validate_url(url, &allowed_hosts, &targets).is_err(), "{url}");
++        }
++        assert!(parse_private_targets("http://*.internal:5201/patrimonio/v4").is_err());
++        assert!(parse_private_targets("http://host.docker.internal/patrimonio/v4").is_err());
++        assert!(parse_private_targets("http://host.docker.internal:5201/other").is_err());
++        assert!(validate_method_for_target("GET", true).is_ok());
++        assert!(validate_method_for_target("POST", true).is_err());
++        assert!(validate_method_for_target("POST", false).is_ok());
+     }
+ 
+     #[test]
+@@ -502,6 +736,10 @@ mod tests {
+         assert!(is_blocked_ip("fd00::1".parse().unwrap()));
+         assert!(!is_blocked_ip("8.8.8.8".parse().unwrap()));
+         assert!(!is_blocked_ip("2606:4700:4700::1111".parse().unwrap()));
++        assert!(is_local_network_ip("10.0.0.1".parse().unwrap()));
++        assert!(!is_local_network_ip("169.254.169.254".parse().unwrap()));
++        assert!(!is_local_network_ip("169.254.1.1".parse().unwrap()));
++        assert!(!is_local_network_ip("8.8.8.8".parse().unwrap()));
+     }
+ 
+     #[test]
+diff --git a/docs/addons/addon-api-reference.md b/docs/addons/addon-api-reference.md
+index e791a5e..6c3dc46 100644
+--- a/docs/addons/addon-api-reference.md
++++ b/docs/addons/addon-api-reference.md
+@@ -1276,6 +1276,25 @@ Prefer brokered `ctx.api.network.request()` over reading a secret into addon
+ JavaScript. The request host must be declared in `network.allowedHosts` and its
+ response body is text, not a binary transport.
+ 
++By default, the network broker permits only HTTPS and rejects private, loopback,
++link-local, and metadata-service addresses. A Wealthfolio host can explicitly
++enable a local read-only API by setting `WF_ADDON_NETWORK_PRIVATE_TARGETS` to a
++comma-separated list of exact URLs in the form
++`http://host:port/patrimonio/v4`. For example:
++
++```text
++WF_ADDON_NETWORK_PRIVATE_TARGETS=http://host.docker.internal:5201/patrimonio/v4,http://host.docker.internal:5301/patrimonio/v4
++```
++
++Each configured target permits only `GET` requests to that exact HTTP origin
++and the `/patrimonio/v4` path or its descendants. The addon's
++`network.allowedHosts` must repeat the host literally; wildcards do not qualify
++for local targets. Wildcards, other ports, schemes, paths, link-local/metadata
++addresses, and public DNS results do not qualify in the operator target.
++Redirects and proxy use remain disabled for these requests, and the broker pins
++the resolved addresses. Leave this setting unset unless the Wealthfolio operator
++intends to allow that local API access.
++
+ #### `delete(key: string): Promise<void>`
+ 
+ Permanently deletes a secret.

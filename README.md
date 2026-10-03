@@ -33,8 +33,9 @@ The integration contract used by the publishers and the connector is in
 
 ## Local source APIs
 
-This Compose file builds the local Wealthfolio source in
-`../CodexTemp/wealthfolio-v3.9.1`. That build accepts only exact
+This Compose file builds Wealthfolio from the upstream v3.9.1 commit pinned
+in the `Dockerfile`, plus the patches in `patches/` (see "Build e patches"
+below). Patch 0000 makes that build accept only exact
 `http://host:port/patrimonio/v4` values in
 `WF_ADDON_NETWORK_PRIVATE_TARGETS`, only `GET` requests, and only addons that
 declare the host literally in `network.allowedHosts`. The example targets point
@@ -64,6 +65,9 @@ network and no writes to CB, CRV or Wealthfolio:
 ```powershell
 docker compose -f compose.addon-sim.yaml run --rm addon-sim
 ```
+
+The simulation compiles the addon with the `esbuild` from `node_modules`, so
+run the package build below (or `npm ci`) once before it on a fresh clone.
 
 With `-e SIM_REAL=1` and the real API envelopes piped to stdin
 (`docker run -i --network none -e SIM_REAL=1 ...`) the same checks run against
@@ -98,9 +102,47 @@ for this machine-to-machine traffic. The connector attempts these aliases after
 the Docker Desktop local targets. The browser-facing services continue behind
 the HTTPS reverse proxy.
 
-## Patch de integração patrimonial
+## Build e patches
 
-O código do Wealthfolio é mantido a partir da versão upstream 3.9.1. Antes de criar a imagem, execute `scripts/apply-upstream-patches.sh` contra o checkout indicado; o script é idempotente e aplica `patches/0001-patrimonio-server-sync.patch`. O patch implementa a sincronização protegida de snapshots CB/CRV v4 usando somente a rede Docker interna e os segredos cifrados do add-on.
+A imagem sai do `Dockerfile` deste repositório, sem nenhuma pasta fora do Git.
+Ele baixa o Wealthfolio no commit fixado da tag v3.9.1 (`WEALTHFOLIO_COMMIT`),
+aplica os arquivos de `patches/` na ordem do nome e compila com as mesmas
+etapas do Dockerfile do upstream, com as imagens-base fixadas por digest.
+O `git apply` não tem tolerância de espaço: patch que não casa exato para o
+build.
+
+| Patch | O que faz |
+|---|---|
+| `0000-addon-network-private-targets` | Libera no broker de rede dos add-ons os alvos locais exatos de `WF_ADDON_NETWORK_PRIVATE_TARGETS`, só GET. Sem a variável, nada muda em relação ao upstream. |
+| `0001-patrimonio-server-sync` | Sincronização dos snapshots v4 do CB e do CRV no servidor, pela rede Docker interna e com os segredos cifrados do add-on. |
+| `0002-patrimonio-sync-runtime-fixes` | Correções de transporte interno e de criação de snapshots. |
+| `0003-fix-patrimonio-account-id-linkage` | Vínculo do id da conta entre o snapshot e a conta criada. |
+
+Até 03/10/2026 o build usava `../CodexTemp/wealthfolio-v3.9.1`, uma cópia do
+upstream com os patches aplicados à mão. O 0000 só existia lá. Upstream mais
+0000 a 0003 foi conferido igual, arquivo a arquivo, a essa cópia.
+
+A CI tem duas partes. O `ci.yml` roda em todo push: confere que os patches
+aplicam no commit fixado, roda a simulação do add-on e valida o Compose. O
+`imagem.yml` constrói a imagem, roda os testes do upstream nos módulos que os
+patches mexem (`docker build --target testes .`) e sobe a imagem até o
+`/api/v1/healthz` responder. Ele só roda quando o `Dockerfile` ou `patches/`
+mudam, e uma vez por mês.
+
+Para criar ou alterar um patch, parta do mesmo ponto que o build:
+
+```bash
+git clone https://github.com/wealthfolio/wealthfolio wf && cd wf
+git checkout <WEALTHFOLIO_COMMIT>
+for p in ../WealthfolioTeste/patches/*.patch; do git apply "$p"; done
+git add -A && git commit -qm "patches atuais"
+# edite e teste com cargo test; depois:
+git diff > ../WealthfolioTeste/patches/0004-<nome>.patch
+```
+
+Para subir de versão, troque `WEALTHFOLIO_COMMIT` pelo commit da tag nova,
+confira que os patches ainda aplicam e compare as etapas do `Dockerfile` com
+as do upstream nessa tag.
 
 ## Backup
 

@@ -1,0 +1,4 @@
+# O build só precisa de `patches/`: o código do Wealthfolio vem do commit
+# fixado no Dockerfile, e nada daqui (add-on, documentação) entra na imagem.
+*
+!patches/

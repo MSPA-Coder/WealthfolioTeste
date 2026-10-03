@@ -3,8 +3,9 @@ name: wealthfolio-teste
 services:
   wealthfolio:
     image: wealthfolio-teste:3.9.1-local
+    # Upstream v3.9.1 fixado por commit, mais `patches/`: ver o Dockerfile.
     build:
-      context: ../CodexTemp/wealthfolio-v3.9.1
+      context: .
     restart: unless-stopped
     # Backup diário no VPS (`manutencao/vps/backup-db.sh`): o diretório deste
     # caminho, DENTRO do contêiner, é copiado com o contêiner pausado por
