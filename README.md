@@ -45,7 +45,7 @@ the network.
 
 ## Connector scheduling
 
-The server imports the CB and CRV snapshots by itself (patch 0004). While
+The server imports the CB and CRV snapshots by itself (patch 0005). While
 `WF_PATRIMONIO_SYNC_INTERVAL_SECS` is set (the Compose file defaults it to 900),
 a worker runs every 15 minutes with no browser involved, and it also runs after
 every restart: the server opens each profile at startup when the worker is on,
@@ -142,7 +142,8 @@ build.
 | `0001-patrimonio-server-sync` | Sincronização dos snapshots v4 do CB e do CRV no servidor, pela rede Docker interna e com os segredos cifrados do add-on. |
 | `0002-patrimonio-sync-runtime-fixes` | Correções de transporte interno e de criação de snapshots. |
 | `0003-fix-patrimonio-account-id-linkage` | Vínculo do id da conta entre o snapshot e a conta criada. |
-| `0004-patrimonio-sync-scheduler-and-adoption` | Importação agendada pelo servidor, com um só mapeamento: adota as contas que o add-on criou, ignora as arquivadas, importa a cada 15 minutos (com atalho pelo feed de mudanças e foto garantida a cada dia) e abre o perfil na partida. |
+| `0004-crv-market-to-mic` | Traduz o mercado do CRV (`B3`, `NYSE`, `NASDAQ`) para o MIC que o Wealthfolio usa para achar o sufixo do Yahoo (`BVMF`, `XNYS`, `XNAS`). Sem isso, as ações da B3 pediam o ticker puro e davam 404. |
+| `0005-patrimonio-sync-scheduler-and-adoption` | Importação agendada pelo servidor, com um só mapeamento: adota as contas que o add-on criou, ignora as arquivadas, importa a cada 15 minutos (com atalho pelo feed de mudanças e foto garantida a cada dia) e abre o perfil na partida. Inclui o mapeamento de mercado do 0004. |
 
 Até 03/10/2026 o build usava `../CodexTemp/wealthfolio-v3.9.1`, uma cópia do
 upstream com os patches aplicados à mão. O 0000 só existia lá. Upstream mais
@@ -163,7 +164,7 @@ git checkout <WEALTHFOLIO_COMMIT>
 for p in ../WealthfolioTeste/patches/*.patch; do git apply "$p"; done
 git add -A && git commit -qm "patches atuais"
 # edite e teste com cargo test; depois:
-git diff > ../WealthfolioTeste/patches/0004-<nome>.patch
+git diff > ../WealthfolioTeste/patches/0006-<nome>.patch
 ```
 
 Para subir de versão, troque `WEALTHFOLIO_COMMIT` pelo commit da tag nova,

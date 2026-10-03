@@ -1,7 +1,7 @@
 # Controle Patrimonial addon
 
 Since 0.4.0 this addon no longer writes to Wealthfolio. Accounts and balances
-are imported by the server (patch 0004, `apps/server/src/api/patrimonio_sync.rs`),
+are imported by the server (patch 0005, `apps/server/src/api/patrimonio_sync.rs`),
 which has a single mapping from the CB and CRV `patrimonio/v4` snapshots to
 Wealthfolio accounts and holdings snapshots. It runs every 15 minutes by itself,
 so the daily snapshot never depends on someone having this page open. The older
