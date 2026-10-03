@@ -100,7 +100,19 @@ the HTTPS reverse proxy.
 
 ## Patch de integração patrimonial
 
-O código do Wealthfolio é mantido a partir da versão upstream 3.9.1. Antes de criar a imagem, execute `scripts/apply-upstream-patches.sh` contra o checkout indicado; o script é idempotente e aplica `patches/0001-patrimonio-server-sync.patch`. O patch implementa a sincronização protegida de snapshots CB/CRV v4 usando somente a rede Docker interna e os segredos cifrados do add-on.
+O código do Wealthfolio é mantido a partir da versão upstream 3.9.1. Antes de criar a imagem, execute `scripts/apply-upstream-patches.sh` contra o checkout indicado; o script é idempotente e aplica, em ordem, todos os `patches/*.patch`. O primeiro patch implementa a sincronização protegida de snapshots CB/CRV v4 usando somente a rede Docker interna e os segredos cifrados do add-on; o `0004` traduz o mercado do CRV (`B3`, `NYSE`, `NASDAQ`) para o MIC (`BVMF`, `XNYS`, `XNAS`), sem o qual o Yahoo recebe o ticker sem sufixo e responde 404.
+
+### Implantar uma mudança de patch no VPS
+
+O `deploy.sh wealthfolio` **não aplica patches** e responde "Nada a fazer" quando o `main` já está implantado, mesmo que o código-fonte tenha mudado. Para uma mudança em `patches/`, na ordem:
+
+1. Mesclar o PR no `main`.
+2. No VPS, aplicar os patches ao checkout do upstream (`apps/CodexTemp/wealthfolio-v3.9.1`): `sh scripts/apply-upstream-patches.sh ~/apps/CodexTemp/wealthfolio-v3.9.1`, a partir de `~/apps/wealthfolio-teste`. A mensagem `patch does not apply` que aparece antes é a verificação reversa do script e não indica falha; confira com `grep` por um símbolo do patch no código-fonte.
+3. Rodar `~/backup-db.sh --forcar` (copia o volume com o contêiner pausado por segundos).
+4. Reconstruir: `docker compose --env-file .env -f compose.yaml -f compose.patrimonio-internal.yaml up -d --build`, a partir de `~/apps/wealthfolio-teste`. A compilação do servidor leva cerca de 35 minutos.
+5. Conferir `/health` e `docker inspect` (contêiner `healthy`).
+
+A sincronização da tela passa pelo **add-on**, não pela rota do servidor (`POST /api/v1/snapshots` vem do navegador). Uma correção de dados enviados ao Wealthfolio costuma precisar das duas pontas: o patch e uma nova versão do add-on, instalada em **Settings > Addons**. Um ativo que já existe não é atualizado pelo Wealthfolio; mudar o MIC cria ativos novos, e os antigos ficam sem posição.
 
 ## Backup
 
