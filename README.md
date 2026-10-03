@@ -45,14 +45,39 @@ the network.
 
 ## Connector scheduling
 
-The `controle-patrimonial-sync` addon stores both Bearer tokens in the local
-system keyring. Once configured, it imports the two complete snapshots at
-startup and every 15 minutes while the addon runtime is active; concurrent runs
-are coalesced. With the phase-4 publisher outboxes installed, it saves a
-checkpoint after a successful snapshot and skips the next snapshot when the
-feed is unchanged. This deployment is a single Wealthfolio instance: device
-sync must remain disabled because addon storage can be replicated between
-devices.
+The server imports the CB and CRV snapshots by itself (patch 0005). While
+`WF_PATRIMONIO_SYNC_INTERVAL_SECS` is set (the Compose file defaults it to 900),
+a worker runs every 15 minutes with no browser involved, and it also runs after
+every restart: the server opens each profile at startup when the worker is on,
+because a profile's background workers otherwise only start when someone makes a
+request. Setting it to `0` or removing it turns the worker off. The minimum is 60.
+
+Each run asks the source's change feed first. With nothing new since the last
+checkpoint, and a successful import already done today, it only touches the status
+and returns. A new day always imports, because the balances the sources publish
+are "as of today". `POST /api/v1/patrimonio-sync/sync` runs one import on demand
+and ignores that shortcut; `GET /api/v1/patrimonio-sync/status` shows each source.
+
+The tokens are the ones saved in the add-on page (`cb.token` and `crv.token` in
+its secret vault). Until they exist, the status is `not_configured`, which is not a
+failure.
+
+The mapping is a single rule. CB: one account per cash account, named
+`CB · <name>`, with one cash balance per day; cards, applications and accounts
+without a published balance are not imported. CRV: one account per (account,
+portfolio, currency), named `CRV · <account> · <portfolio>`, in the holdings
+currency, with the open equity positions. An account that leaves a source, which
+the source must declare as a complete collection, gets an empty snapshot instead of
+keeping a stale one.
+
+The accounts are found by the `meta` marker the older add-on wrote
+(`controlePatrimonial:...`), then by provider identity, so accounts created before
+the worker are adopted rather than duplicated. **Archived accounts are never
+touched.** To retire a duplicate, archive it in Settings > Accounts; do not delete
+it. A source account with no live account gets a new one.
+
+This deployment is a single Wealthfolio instance: device sync must remain
+disabled because addon storage can be replicated between devices.
 
 ## Addon simulation (run before packaging)
 
@@ -118,6 +143,7 @@ build.
 | `0002-patrimonio-sync-runtime-fixes` | Correções de transporte interno e de criação de snapshots. |
 | `0003-fix-patrimonio-account-id-linkage` | Vínculo do id da conta entre o snapshot e a conta criada. |
 | `0004-crv-market-to-mic` | Traduz o mercado do CRV (`B3`, `NYSE`, `NASDAQ`) para o MIC que o Wealthfolio usa para achar o sufixo do Yahoo (`BVMF`, `XNYS`, `XNAS`). Sem isso, as ações da B3 pediam o ticker puro e davam 404. |
+| `0005-patrimonio-sync-scheduler-and-adoption` | Importação agendada pelo servidor, com um só mapeamento: adota as contas que o add-on criou, ignora as arquivadas, importa a cada 15 minutos (com atalho pelo feed de mudanças e foto garantida a cada dia) e abre o perfil na partida. Inclui o mapeamento de mercado do 0004. |
 
 Até 03/10/2026 o build usava `../CodexTemp/wealthfolio-v3.9.1`, uma cópia do
 upstream com os patches aplicados à mão. O 0000 só existia lá. Upstream mais
@@ -138,7 +164,7 @@ git checkout <WEALTHFOLIO_COMMIT>
 for p in ../WealthfolioTeste/patches/*.patch; do git apply "$p"; done
 git add -A && git commit -qm "patches atuais"
 # edite e teste com cargo test; depois:
-git diff > ../WealthfolioTeste/patches/0005-<nome>.patch
+git diff > ../WealthfolioTeste/patches/0006-<nome>.patch
 ```
 
 Para subir de versão, troque `WEALTHFOLIO_COMMIT` pelo commit da tag nova,
