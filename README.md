@@ -33,8 +33,9 @@ The integration contract used by the publishers and the connector is in
 
 ## Local source APIs
 
-This Compose file builds the local Wealthfolio source in
-`../CodexTemp/wealthfolio-v3.9.1`. That build accepts only exact
+This Compose file builds Wealthfolio from the upstream v3.9.1 commit pinned
+in the `Dockerfile`, plus the patches in `patches/` (see "Build e patches"
+below). Patch 0000 makes that build accept only exact
 `http://host:port/patrimonio/v4` values in
 `WF_ADDON_NETWORK_PRIVATE_TARGETS`, only `GET` requests, and only addons that
 declare the host literally in `network.allowedHosts`. The example targets point
@@ -64,6 +65,9 @@ network and no writes to CB, CRV or Wealthfolio:
 ```powershell
 docker compose -f compose.addon-sim.yaml run --rm addon-sim
 ```
+
+The simulation compiles the addon with the `esbuild` from `node_modules`, so
+run the package build below (or `npm ci`) once before it on a fresh clone.
 
 With `-e SIM_REAL=1` and the real API envelopes piped to stdin
 (`docker run -i --network none -e SIM_REAL=1 ...`) the same checks run against
@@ -98,21 +102,68 @@ for this machine-to-machine traffic. The connector attempts these aliases after
 the Docker Desktop local targets. The browser-facing services continue behind
 the HTTPS reverse proxy.
 
-## Patch de integração patrimonial
+## Build e patches
 
-O código do Wealthfolio é mantido a partir da versão upstream 3.9.1. Antes de criar a imagem, execute `scripts/apply-upstream-patches.sh` contra o checkout indicado; o script é idempotente e aplica, em ordem, todos os `patches/*.patch`. O primeiro patch implementa a sincronização protegida de snapshots CB/CRV v4 usando somente a rede Docker interna e os segredos cifrados do add-on; o `0004` traduz o mercado do CRV (`B3`, `NYSE`, `NASDAQ`) para o MIC (`BVMF`, `XNYS`, `XNAS`), sem o qual o Yahoo recebe o ticker sem sufixo e responde 404.
+A imagem sai do `Dockerfile` deste repositório, sem nenhuma pasta fora do Git.
+Ele baixa o Wealthfolio no commit fixado da tag v3.9.1 (`WEALTHFOLIO_COMMIT`),
+aplica os arquivos de `patches/` na ordem do nome e compila com as mesmas
+etapas do Dockerfile do upstream, com as imagens-base fixadas por digest.
+O `git apply` não tem tolerância de espaço: patch que não casa exato para o
+build.
+
+| Patch | O que faz |
+|---|---|
+| `0000-addon-network-private-targets` | Libera no broker de rede dos add-ons os alvos locais exatos de `WF_ADDON_NETWORK_PRIVATE_TARGETS`, só GET. Sem a variável, nada muda em relação ao upstream. |
+| `0001-patrimonio-server-sync` | Sincronização dos snapshots v4 do CB e do CRV no servidor, pela rede Docker interna e com os segredos cifrados do add-on. |
+| `0002-patrimonio-sync-runtime-fixes` | Correções de transporte interno e de criação de snapshots. |
+| `0003-fix-patrimonio-account-id-linkage` | Vínculo do id da conta entre o snapshot e a conta criada. |
+| `0004-crv-market-to-mic` | Traduz o mercado do CRV (`B3`, `NYSE`, `NASDAQ`) para o MIC que o Wealthfolio usa para achar o sufixo do Yahoo (`BVMF`, `XNYS`, `XNAS`). Sem isso, as ações da B3 pediam o ticker puro e davam 404. |
+
+Até 03/10/2026 o build usava `../CodexTemp/wealthfolio-v3.9.1`, uma cópia do
+upstream com os patches aplicados à mão. O 0000 só existia lá. Upstream mais
+0000 a 0003 foi conferido igual, arquivo a arquivo, a essa cópia.
+
+A CI tem duas partes. O `ci.yml` roda em todo push: confere que os patches
+aplicam no commit fixado, roda a simulação do add-on e valida o Compose. O
+`imagem.yml` constrói a imagem, roda os testes do upstream nos módulos que os
+patches mexem (`docker build --target testes .`) e sobe a imagem até o
+`/api/v1/healthz` responder. Ele só roda quando o `Dockerfile` ou `patches/`
+mudam, e uma vez por mês.
+
+Para criar ou alterar um patch, parta do mesmo ponto que o build:
+
+```bash
+git clone https://github.com/wealthfolio/wealthfolio wf && cd wf
+git checkout <WEALTHFOLIO_COMMIT>
+for p in ../WealthfolioTeste/patches/*.patch; do git apply "$p"; done
+git add -A && git commit -qm "patches atuais"
+# edite e teste com cargo test; depois:
+git diff > ../WealthfolioTeste/patches/0005-<nome>.patch
+```
+
+Para subir de versão, troque `WEALTHFOLIO_COMMIT` pelo commit da tag nova,
+confira que os patches ainda aplicam e compare as etapas do `Dockerfile` com
+as do upstream nessa tag.
 
 ### Implantar uma mudança de patch no VPS
 
-O `deploy.sh wealthfolio` **não aplica patches** e responde "Nada a fazer" quando o `main` já está implantado, mesmo que o código-fonte tenha mudado. Para uma mudança em `patches/`, na ordem:
+O `deploy.sh wealthfolio` responde "Nada a fazer" quando o `main` já está
+implantado, e não aplica patches por conta própria. Com o `Dockerfile` deste
+repositório isso deixa de importar: o patch entra no build pelo próprio
+`docker compose`, sem checkout intermediário. Na ordem:
 
-1. Mesclar o PR no `main`.
-2. No VPS, aplicar os patches ao checkout do upstream (`apps/CodexTemp/wealthfolio-v3.9.1`): `sh scripts/apply-upstream-patches.sh ~/apps/CodexTemp/wealthfolio-v3.9.1`, a partir de `~/apps/wealthfolio-teste`. A mensagem `patch does not apply` que aparece antes é a verificação reversa do script e não indica falha; confira com `grep` por um símbolo do patch no código-fonte.
-3. Rodar `~/backup-db.sh --forcar` (copia o volume com o contêiner pausado por segundos).
-4. Reconstruir: `docker compose --env-file .env -f compose.yaml -f compose.patrimonio-internal.yaml up -d --build`, a partir de `~/apps/wealthfolio-teste`. A compilação do servidor leva cerca de 35 minutos.
-5. Conferir `/health` e `docker inspect` (contêiner `healthy`).
+1. Mesclar o PR no `main` (a CI já provou que a cadeia compila e a imagem sobe).
+2. No VPS, em `~/apps/wealthfolio-teste`: `git pull --ff-only`.
+3. `~/backup-db.sh --forcar` (copia o volume com o contêiner pausado por segundos).
+4. `docker compose --env-file .env -f compose.yaml -f compose.patrimonio-internal.yaml up -d --build`. A compilação do servidor leva de 30 a 60 minutos.
+5. Conferir `/api/v1/healthz` e `docker inspect` (contêiner `healthy`).
 
-A sincronização da tela passa pelo **add-on**, não pela rota do servidor (`POST /api/v1/snapshots` vem do navegador). Uma correção de dados enviados ao Wealthfolio costuma precisar das duas pontas: o patch e uma nova versão do add-on, instalada em **Settings > Addons**. Um ativo que já existe não é atualizado pelo Wealthfolio; mudar o MIC cria ativos novos, e os antigos ficam sem posição.
+Dois cuidados que custaram caro: o Wealthfolio não atualiza o MIC de um ativo
+que já existe, então mudar o MIC cria ativos novos e os antigos ficam sem
+posição (a limpeza é pela tela); e, enquanto o add-on for anterior à 0.4.0, a
+sincronização da tela passa por ele, não pelo servidor, então uma correção de
+dados costuma precisar do patch e de uma nova versão do add-on, instalada em
+**Settings > Addons**.
 
 ## Backup
 

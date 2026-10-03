@@ -1,0 +1,64 @@
+name: CI
+
+# O que é rápido roda em todo push e PR. O build da imagem, que leva dezenas de
+# minutos, fica em `imagem.yml` e só roda quando o que entra nela muda.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verificar:
+    name: Patches, add-on e Compose
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # O mesmo que o estágio `fonte` do Dockerfile faz, em segundos: o commit
+      # vem do próprio Dockerfile, e os patches entram na ordem do nome, sem
+      # tolerância de espaço. Um patch que não aplica reprova aqui, antes de
+      # qualquer build.
+      - name: Patches aplicam no commit fixado do upstream
+        run: |
+          set -euo pipefail
+          commit=$(sed -n 's/^ARG WEALTHFOLIO_COMMIT=//p' Dockerfile)
+          test -n "$commit"
+          git init -q "$RUNNER_TEMP/upstream"
+          git -C "$RUNNER_TEMP/upstream" fetch -q --depth 1 https://github.com/wealthfolio/wealthfolio "$commit"
+          git -C "$RUNNER_TEMP/upstream" checkout -q --detach FETCH_HEAD
+          for patch in patches/*.patch; do
+            git -C "$RUNNER_TEMP/upstream" apply "$PWD/$patch"
+            echo "aplica: $patch"
+          done
+
+      # A simulação roda o `src/addon.tsx` de verdade contra um host Wealthfolio
+      # em memória, sem rede. O `npm ci` vem antes porque ela compila o add-on
+      # com o esbuild do node_modules. Depois, o ZIP versionado em `release/` é
+      # aberto e executado como o Wealthfolio o carregaria.
+      - name: Simulação do add-on e conferência do pacote
+        run: |
+          set -euo pipefail
+          imagem=node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1
+          dir="$PWD/addons/controle-patrimonial-sync"
+          docker run --rm -v "$dir:/workspace" -w /workspace "$imagem" npm ci --no-audit --no-fund
+          docker compose -f compose.addon-sim.yaml run --rm addon-sim
+          docker run --rm --network none -v "$dir:/workspace:ro" -w /workspace "$imagem" node sim/verify-package.mjs
+
+      # Valores de mentira só para o Compose interpolar: `config` não abre o
+      # arquivo nem confere o hash.
+      - name: Compose válido, com e sem a rede interna do VPS
+        env:
+          WF_SECRET_KEY_HOST_PATH: /dev/null
+          WF_AUTH_PASSWORD_HASH: placeholder
+        run: |
+          docker compose config --quiet
+          docker compose -f compose.yaml -f compose.patrimonio-internal.yaml config --quiet
