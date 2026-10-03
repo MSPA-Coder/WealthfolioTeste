@@ -15,6 +15,12 @@ pela diferença entre o CodexTemp e o upstream v3.9.1 (392f272), descontados os
 patches 0001 a 0003. Vem antes deles porque o 0001 comenta a mesma variável no
 compose.yml.
 
+Correção do teste (03/10/2026): `local_targets_are_restricted_to_exact_http_origin_and_api_path`
+esperava erro em validate_url para https na mesma origem, mas o https segue o caminho
+comum (alvo local = false) e quem o recusa é resolve_addresses, que rejeita endereço
+privado. O teste reprovava contra o próprio código; agora afirma o comportamento real.
+Só o módulo de testes mudou; o código compilado é o mesmo que roda em produção.
+
 diff --git a/compose.yml b/compose.yml
 index 4428794..acb6829 100644
 --- a/compose.yml
@@ -29,7 +35,7 @@ index 4428794..acb6829 100644
        # ── Authentication ────────────────────────────────────────────────
        # Required when listening on 0.0.0.0 (the default for Docker).
 diff --git a/crates/core/src/addons/network.rs b/crates/core/src/addons/network.rs
-index a21f50b..2c57522 100644
+index a21f50b..b4b569e 100644
 --- a/crates/core/src/addons/network.rs
 +++ b/crates/core/src/addons/network.rs
 @@ -19,6 +19,15 @@ const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
@@ -138,8 +144,7 @@ index a21f50b..2c57522 100644
 +                .to_string(),
 +        );
 +    }
- 
--    Ok(parsed)
++
 +    Ok((parsed, is_private_target))
 +}
 +
@@ -225,7 +230,8 @@ index a21f50b..2c57522 100644
 +    }
 +    Ok(targets)
 +}
-+
+ 
+-    Ok(parsed)
 +fn target_matches_host(target: &AddonNetworkPrivateTarget, host: &str) -> bool {
 +    target.host == normalize_host(host)
 +}
@@ -301,7 +307,7 @@ index a21f50b..2c57522 100644
          resolved.push(address);
      }
  
-@@ -484,13 +650,81 @@ mod tests {
+@@ -484,13 +650,90 @@ mod tests {
  
      #[test]
      fn validates_allowed_hosts() {
@@ -373,7 +379,6 @@ index a21f50b..2c57522 100644
 +        }
 +        for url in [
 +            "http://host.docker.internal:5202/patrimonio/v4/snapshot",
-+            "https://host.docker.internal:5201/patrimonio/v4/snapshot",
 +            "http://host.docker.internal:5201/other",
 +            "http://host.docker.internal:5201/patrimonio/v40/snapshot",
 +            "http://host.docker.internal:5201/patrimonio/v4%2fsnapshot",
@@ -381,6 +386,16 @@ index a21f50b..2c57522 100644
 +        ] {
 +            assert!(validate_url(url, &allowed_hosts, &targets).is_err(), "{url}");
 +        }
++        // Another scheme on the same origin is not a local target. It takes the
++        // ordinary HTTPS path instead, where resolve_addresses refuses private
++        // addresses, so it can never reach the local API.
++        let (_, is_local) = validate_url(
++            "https://host.docker.internal:5201/patrimonio/v4/snapshot",
++            &allowed_hosts,
++            &targets,
++        )
++        .unwrap();
++        assert!(!is_local);
 +        assert!(parse_private_targets("http://*.internal:5201/patrimonio/v4").is_err());
 +        assert!(parse_private_targets("http://host.docker.internal/patrimonio/v4").is_err());
 +        assert!(parse_private_targets("http://host.docker.internal:5201/other").is_err());
@@ -390,7 +405,7 @@ index a21f50b..2c57522 100644
      }
  
      #[test]
-@@ -502,6 +736,10 @@ mod tests {
+@@ -502,6 +745,10 @@ mod tests {
          assert!(is_blocked_ip("fd00::1".parse().unwrap()));
          assert!(!is_blocked_ip("8.8.8.8".parse().unwrap()));
          assert!(!is_blocked_ip("2606:4700:4700::1111".parse().unwrap()));
