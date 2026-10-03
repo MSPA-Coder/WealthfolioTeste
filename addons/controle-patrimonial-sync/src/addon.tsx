@@ -25,6 +25,11 @@ const RECORDS_PAGE_SIZE = 50;
 const STORAGE_CHUNK_LIMIT_BYTES = 180_000;
 const SANITIZED_FAILURE = 'Falha ao sincronizar esta fonte. Verifique a disponibilidade e tente novamente.';
 
+// O CRV nomeia o mercado; o Wealthfolio espera o MIC (ISO 10383). Sem ele o
+// resolvedor de cotações não acha o sufixo do Yahoo (.SA na B3) e pede o ticker
+// puro, que o Yahoo recusa com 404. Mantenha igual a market_to_mic do patch 0004.
+const MARKET_TO_MIC: Record<string, string> = { B3: 'BVMF', NYSE: 'XNYS', NASDAQ: 'XNAS' };
+
 let activeSync: Promise<void> | undefined;
 
 interface CbAccount {
@@ -557,7 +562,7 @@ async function syncCrv(ctx: AddonContext): Promise<AppliedSnapshot> {
       currency: holding.currency,
       averageCost: holding.average_cost,
       quoteCcy: holding.currency,
-      exchangeMic: holding.market,
+      exchangeMic: MARKET_TO_MIC[holding.market] ?? holding.market,
       instrumentType: 'EQUITY',
       dataSource: 'controle-renda-variavel',
     }));

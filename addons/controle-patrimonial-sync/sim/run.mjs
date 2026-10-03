@@ -173,6 +173,8 @@ let baseline;
   const crvSnaps = crvAccounts.map((a) => host.snapshots.get(`${a.id}_${fx.crvSnapshot.data_de_referencia}`));
   check('B rascunho corrigido', `CRV: ${crvSnaps.reduce((n, s) => n + s.holdings.length, 0)} posições em ${crvSnaps.length} snapshots, sem caixa (proventos não viram caixa)`, crvSnaps.every(Boolean) && crvSnaps.reduce((n, s) => n + s.holdings.length, 0) === e.crvHoldings && crvSnaps.every((s) => Object.keys(s.cash).length === 0));
 
+  check('B MIC da bolsa', 'toda posição CRV chega com o MIC (BVMF), não com o nome do mercado (B3)', crvSnaps.every((s) => s.holdings.every((h) => h.exchangeMic === 'BVMF')));
+
   let maxValue = 0; let maxPayload = 0; let maxKey = 0;
   for (const [k, v] of host.store) { maxValue = Math.max(maxValue, bytes(v)); maxPayload = Math.max(maxPayload, bytes(JSON.stringify({ addon_id: manifest.id, key: k, value: v }))); maxKey = Math.max(maxKey, k.length); }
   console.log(`   (maior valor: ${maxValue} B; maior payload do host: ${maxPayload} B de ${host.MAX_STORAGE_PAYLOAD}; maior chave: ${maxKey} de 128; chaves no storage: ${host.store.size})`);
