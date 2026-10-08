@@ -173,16 +173,23 @@ as do upstream nessa tag.
 
 ### Implantar uma mudança de patch no VPS
 
-O `deploy.sh wealthfolio` responde "Nada a fazer" quando o `main` já está
-implantado, e não aplica patches por conta própria. Com o `Dockerfile` deste
-repositório isso deixa de importar: o patch entra no build pelo próprio
-`docker compose`, sem checkout intermediário. Na ordem:
+Publique por branch, pull request com checks obrigatórios verdes e squash merge.
+O checkout do VPS é somente um espelho do `main`: não faça `git pull`, build ou
+commit manual nele. Depois do merge, execute uma única operação:
 
-1. Mesclar o PR no `main` (a CI já provou que a cadeia compila e a imagem sobe).
-2. No VPS, em `~/apps/wealthfolio-teste`: `git pull --ff-only`.
-3. `~/backup-db.sh --forcar` (copia o volume com o contêiner pausado por segundos).
-4. `docker compose --env-file .env -f compose.yaml -f compose.patrimonio-internal.yaml up -d --build`. A compilação do servidor leva de 30 a 60 minutos.
-5. Conferir `/api/v1/healthz` e `docker inspect` (contêiner `healthy`).
+```bash
+~/deploy.sh wealthfolio
+```
+
+O script central atualiza por fast-forward, reconstrói com o Compose correto,
+aguarda o contêiner e confirma a saúde pelo endereço público. Em falha posterior
+ao fast-forward, restaura o commit e a imagem anteriores. `~/deploy.sh --status`
+continua disponível apenas para diagnóstico transversal.
+
+Antes de uma mudança que migre ou transforme dados, faça backup verificado pelo
+fluxo central e defina o retorno de schema/dados: o rollback do deploy não
+reverte o SQLite. Para uma mudança só de código ou patch, a cópia diária válida
+não deve ser refeita apenas como ritual.
 
 Dois cuidados que custaram caro: o Wealthfolio não atualiza o MIC de um ativo
 que já existe, então mudar o MIC cria ativos novos e os antigos ficam sem
