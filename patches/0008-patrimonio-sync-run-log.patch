@@ -1,0 +1,30 @@
+diff --git a/apps/server/src/api/patrimonio_sync.rs b/apps/server/src/api/patrimonio_sync.rs
+--- a/apps/server/src/api/patrimonio_sync.rs
++++ b/apps/server/src/api/patrimonio_sync.rs
+@@ -1047,13 +1047,25 @@ fn parse_cron(raw: &str) -> Result<CronSchedule, String> {
+ /// Whether the periodic import is switched on. It decides if profiles are opened
+ /// at startup, because the worker lives in the profile's runtime.
+ pub(crate) fn scheduler_enabled() -> bool {
+     configured_schedule().ok().flatten().is_some()
+ }
+ 
++/// One line per run, whatever the outcome. A run that went well used to leave
++/// no trace, so a log reader could not tell "the importer is alive" from "the
++/// importer stopped". Failures keep their own warning.
++fn run_summary(statuses: &[SourceStatus]) -> String {
++    statuses
++        .iter()
++        .map(|status| format!("{}={}", status.source, status.state))
++        .collect::<Vec<_>>()
++        .join(" ")
++}
++
+ async fn run_scheduled_sync(runtime: &AppState) {
+     match run_sync(runtime, false).await {
+         None => tracing::debug!("Patrimonio sync skipped: a run is already in progress"),
+         Some(Err(_)) => tracing::warn!("Patrimonio sync could not save its status"),
+         Some(Ok(statuses)) => {
++            tracing::info!("Patrimonio sync run finished: {}", run_summary(&statuses));
+             for status in statuses.iter().filter(|status| status.state == "failed") {
+                 tracing::warn!("Patrimonio sync failed for source {}", status.source);
+             }
