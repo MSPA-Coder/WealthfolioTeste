@@ -1,0 +1,111 @@
+diff --git a/apps/server/src/api/patrimonio_sync.rs b/apps/server/src/api/patrimonio_sync.rs
+index 356b45799..aea791923 100644
+--- a/apps/server/src/api/patrimonio_sync.rs
++++ b/apps/server/src/api/patrimonio_sync.rs
+@@ -63,7 +63,6 @@ const CB_PROVIDER: &str = "PATRIMONIO_CB";
+ const CRV_PROVIDER: &str = "PATRIMONIO_CRV";
+ const CB_ACCOUNT_PREFIX: &str = "controle-bancario:account:";
+ const CRV_ACCOUNT_PREFIX: &str = "crv:";
+-const DATA_SOURCE: &str = "controle-renda-variavel";
+ 
+ /// Seconds between scheduled runs. Unset or 0 keeps the worker off.
+ const INTERVAL_ENV: &str = "WF_PATRIMONIO_SYNC_INTERVAL_SECS";
+@@ -532,7 +531,6 @@ async fn sync_crv_holdings(
+             .and_then(Value::as_str)
+             .unwrap_or_default();
+         let exchange_mic = market_to_mic(market);
+-        let instrument_key = format!("{exchange_mic}:{symbol}:{currency}");
+         let quantity = parse_decimal_field(holding, "quantity", "quantidade CRV")?;
+         let average_cost = parse_decimal_field(holding, "average_cost", "custo médio CRV")?;
+         let group = groups
+@@ -542,21 +540,13 @@ async fn sync_crv_holdings(
+                 currency: currency.to_string(),
+                 positions: Vec::new(),
+             });
+-        group.positions.push(ManualHoldingInput {
+-            asset_id: Some(stable_id("crv-asset", &instrument_key)),
+-            symbol: symbol.to_string(),
+-            exchange_mic: Some(exchange_mic.to_string()),
++        group.positions.push(crv_holding_input(
++            symbol,
++            exchange_mic,
++            currency,
+             quantity,
+-            currency: currency.to_string(),
+             average_cost,
+-            name: None,
+-            data_source: Some(DATA_SOURCE.to_string()),
+-            asset_kind: None,
+-            quote_ccy: Some(currency.to_string()),
+-            instrument_type: Some("EQUITY".into()),
+-            provider_id: None,
+-            provider_symbol: None,
+-        });
++        ));
+     }
+ 
+     let mut active = BTreeSet::new();
+@@ -612,6 +602,38 @@ async fn sync_crv_holdings(
+     Ok((holdings.len(), snapshots_saved, snapshots_saved))
+ }
+ 
++/// Builds a holding without pinning it to a synthetic source id.
++///
++/// `ManualSnapshotService` resolves the canonical `(symbol, MIC, currency)` key
++/// before it creates an asset. Supplying the old deterministic `crv-asset-*`
++/// id made that service return legacy, metadata-free assets unchanged, so the
++/// holdings and valuation readers later discarded their positions. Leaving the
++/// id empty repairs those records on the next snapshot and keeps later imports
++/// on the resolved asset by instrument key.
++fn crv_holding_input(
++    symbol: &str,
++    exchange_mic: &str,
++    currency: &str,
++    quantity: Decimal,
++    average_cost: Decimal,
++) -> ManualHoldingInput {
++    ManualHoldingInput {
++        asset_id: None,
++        symbol: symbol.to_string(),
++        exchange_mic: Some(exchange_mic.to_string()),
++        quantity,
++        currency: currency.to_string(),
++        average_cost,
++        name: None,
++        data_source: None,
++        asset_kind: None,
++        quote_ccy: Some(currency.to_string()),
++        instrument_type: Some("EQUITY".into()),
++        provider_id: None,
++        provider_symbol: None,
++    }
++}
++
+ /// Non-archived accounts whose marker starts with `prefix`.
+ fn accounts_with_marker_prefix(state: &AppState, prefix: &str) -> Result<Vec<Account>, String> {
+     Ok(state
+@@ -961,6 +983,24 @@ mod tests {
+         assert_eq!(market_to_mic("XLON"), "XLON");
+     }
+ 
++    #[test]
++    fn crv_holdings_defer_asset_identity_to_the_canonical_resolver() {
++        let holding = crv_holding_input(
++            "BRK-B",
++            market_to_mic("NYSE"),
++            "USD",
++            Decimal::new(3, 0),
++            Decimal::new(500, 0),
++        );
++
++        assert_eq!(holding.asset_id, None);
++        assert_eq!(holding.symbol, "BRK-B");
++        assert_eq!(holding.exchange_mic.as_deref(), Some("XNYS"));
++        assert_eq!(holding.quote_ccy.as_deref(), Some("USD"));
++        assert_eq!(holding.instrument_type.as_deref(), Some("EQUITY"));
++        assert_eq!(holding.data_source, None);
++    }
++
+     #[test]
+     fn validates_v4_contract() {
+         assert!(validate_contract(&serde_json::json!({"contrato": "patrimonio/v4"})).is_ok());
