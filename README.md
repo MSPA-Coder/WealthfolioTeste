@@ -45,12 +45,20 @@ the network.
 
 ## Connector scheduling
 
-The server imports the CB and CRV snapshots by itself (patch 0005). While
-`WF_PATRIMONIO_SYNC_INTERVAL_SECS` is set (the Compose file defaults it to 900),
-a worker runs every 15 minutes with no browser involved, and it also runs after
-every restart: the server opens each profile at startup when the worker is on,
-because a profile's background workers otherwise only start when someone makes a
-request. Setting it to `0` or removing it turns the worker off. The minimum is 60.
+The server imports the CB and CRV snapshots by itself. `WF_PATRIMONIO_SYNC_CRON`
+is a five-field cron expression evaluated in `America/Sao_Paulo`; it defaults to
+`0 8,14 * * 1-5` (08:00 and 14:00, Monday through Friday). It accepts `*`,
+comma-separated values, ranges and `/step`; both `0` and `7` mean Sunday. When
+the cron variable is empty or absent, the legacy
+`WF_PATRIMONIO_SYNC_INTERVAL_SECS` interval is used instead (default: 900
+seconds; `0` disables it). Cron takes precedence when both are present.
+
+Changing only `WF_PATRIMONIO_SYNC_CRON` in `.env` is a runtime configuration
+change: recreate the service with the existing image (`docker compose up -d
+--no-build --force-recreate wealthfolio`) and no compilation is required. The
+worker needs no browser; the server opens each profile at startup while either
+scheduler is enabled, because the profile workers otherwise start only after a
+request.
 
 Each run asks the source's change feed first. With nothing new since the last
 checkpoint, and a successful import already done today, it only touches the status
