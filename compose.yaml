@@ -46,11 +46,27 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
+    # Endurecimento no padrão dos outros apps do VPS (10/10/2026, DOCK-01): era
+    # o único contêiner de produção sem `cap_drop`, limites e rotação de log.
+    # O servidor roda como 1000:1000 numa porta acima de 1024 e não precisa de
+    # capability nenhuma. Em repouso usa ~6 MiB e 6 processos; o teto de PIDs
+    # deixa folga ao pool de threads bloqueantes do tokio.
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
     read_only: true
     tmpfs:
       - /tmp:size=64M
+    init: true
+    cpus: 2.0
+    mem_limit: 512m
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   wealthfolio-teste-data:

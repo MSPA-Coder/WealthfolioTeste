@@ -37,9 +37,11 @@ jobs:
       - name: Imagem final
         run: docker build -t wealthfolio-teste:ci .
 
-      # Sobe como no VPS: banco cifrado exigido, chave mestra por arquivo e
-      # sistema de arquivos só de leitura. O critério é o do deploy.sh, o
-      # /api/v1/healthz respondendo "ok". A chave é efêmera e não protege nada.
+      # Sobe como no VPS: banco cifrado exigido, chave mestra por arquivo,
+      # sistema de arquivos só de leitura e as mesmas restrições do compose.yaml
+      # (sem capability, limites de memória, PIDs e CPU, init). O critério é o
+      # do deploy.sh, o /api/v1/healthz respondendo "ok". A chave é efêmera e
+      # não protege nada.
       - name: A imagem sobe e responde
         run: |
           set -euo pipefail
@@ -47,6 +49,8 @@ jobs:
           openssl rand -base64 32 > "$chave"
           chmod 644 "$chave"
           docker run -d --name wf -p 127.0.0.1:18088:8088 --read-only --tmpfs /tmp \
+            --cap-drop ALL --security-opt no-new-privileges:true --init \
+            --memory 512m --pids-limit 256 --cpus 2 \
             -v wf-dados:/data -v "$chave:/run/secrets/wealthfolio_master_key:ro" \
             -e WF_LISTEN_ADDR=0.0.0.0:8088 -e WF_DB_PATH=/data/wealthfolio.db \
             -e WF_SECRET_KEY_FILE=/run/secrets/wealthfolio_master_key \
