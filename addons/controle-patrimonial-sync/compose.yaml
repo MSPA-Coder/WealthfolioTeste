@@ -4,7 +4,7 @@ name: wealthfolio-addon-sim
 # e sem rede: nenhuma escrita em CB, CRV ou Wealthfolio. Rode antes de empacotar.
 services:
   addon-sim:
-    image: node:24-alpine
+    image: node:26-alpine
     pull_policy: always
     working_dir: /workspace
     network_mode: none
