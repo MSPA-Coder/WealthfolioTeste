@@ -1,7 +1,7 @@
 // Simulação ponta a ponta do add-on contra um host Wealthfolio simulado.
 // Executa a lógica REAL de src/addon.tsx (compilada em memória pelo esbuild).
 // Só imprime metadados: nomes de cenário, contagens, tamanhos e PASS/FAIL.
-//   docker compose -f compose.addon-sim.yaml run --rm addon-sim
+//   docker compose -f addons/controle-patrimonial-sync/compose.yaml run --rm addon-sim
 import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';

@@ -2,10 +2,12 @@ name: wealthfolio-teste
 
 services:
   wealthfolio:
-    image: wealthfolio-teste:3.9.1-local
-    # Upstream v3.9.1 fixado por commit, mais `patches/`: ver o Dockerfile.
+    image: wealthfolio-teste:local
+    pull_policy: build
+    # Commit da release upstream validada, mais `patches/`: ver o Dockerfile.
     build:
       context: .
+      pull: true
     restart: unless-stopped
     # Backup diário no VPS (`manutencao/vps/backup-db.sh`): o diretório deste
     # caminho, DENTRO do contêiner, é copiado com o contêiner pausado por
@@ -35,8 +37,8 @@ services:
       WF_DB_REQUIRE_ENCRYPTION: "1"
       WF_ADDON_NETWORK_PRIVATE_TARGETS: "${WF_ADDON_NETWORK_PRIVATE_TARGETS:-}"
       # Cron do CB/CRV (patch 0007), em America/Sao_Paulo. O padrão é 08:00 e
-      # 14:00 de segunda a sexta; uma alteração no .env só exige recriar o
-      # contêiner com a imagem existente.
+      # 14:00 de segunda a sexta; uma alteração no .env recria o contêiner e
+      # usa o build atualizado pela tag móvel do upstream.
       WF_PATRIMONIO_SYNC_CRON: "${WF_PATRIMONIO_SYNC_CRON:-0 8,14 * * 1-5}"
       # Compatibilidade para instalações sem cron: intervalo em segundos. 0 desliga.
       WF_PATRIMONIO_SYNC_INTERVAL_SECS: "${WF_PATRIMONIO_SYNC_INTERVAL_SECS:-900}"

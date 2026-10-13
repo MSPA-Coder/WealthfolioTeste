@@ -1,0 +1,80 @@
+name: Dependabot auto-merge
+
+on:
+  workflow_run:
+    workflows: ["CI", "Imagem"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    name: Auto merge
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      (startsWith(github.event.workflow_run.head_branch, 'dependabot/') ||
+       github.event.workflow_run.head_branch == 'automation/wealthfolio-upstream') &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Merge only the exact tested dependency or upstream commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          prs="$(gh pr list --repo "$REPO" --state open --head "$HEAD_BRANCH" --json number,headRefOid,headRefName,author,baseRefName)"
+          pr="$(jq -er --arg sha "$HEAD_SHA" '[.[] | select(.headRefOid == $sha and ((.author.login == "dependabot[bot]") or (.author.login == "github-actions[bot]" and .headRefName == "automation/wealthfolio-upstream")) and .baseRefName == "main")] | if length == 1 then .[0].number else error("no unique matching tested PR") end' <<< "$prs")"
+          files="$(gh pr view "$pr" --repo "$REPO" --json files --jq '[.files[].path] | .[]')"
+          image_required=false
+          while IFS= read -r file; do
+            case "$file" in
+              Dockerfile|.dockerignore|patches/*|.github/workflows/imagem.yml)
+                image_required=true
+                ;;
+            esac
+          done <<< "$files"
+
+          # O endpoint de check-runs só mostra workflows que já começaram.
+          # Exija CI e, quando a mudança afeta a imagem, o run Imagem concluído
+          # no mesmo SHA para evitar merge durante a abertura dos outros runs.
+          runs="$(gh api "repos/$REPO/actions/runs?head_sha=$HEAD_SHA&per_page=100")"
+          jq -e --arg sha "$HEAD_SHA" --arg branch "$HEAD_BRANCH" '
+            [.workflow_runs[] | select(.head_sha == $sha and .head_branch == $branch and .path == ".github/workflows/ci.yml")]
+            | sort_by(.run_number) | last
+            | .status == "completed" and .conclusion == "success"
+          ' <<< "$runs" >/dev/null
+          if [[ "$image_required" == true ]]; then
+            jq -e --arg sha "$HEAD_SHA" --arg branch "$HEAD_BRANCH" '
+              [.workflow_runs[] | select(.head_sha == $sha and .head_branch == $branch and .path == ".github/workflows/imagem.yml")]
+              | sort_by(.run_number) | last
+              | .status == "completed" and .conclusion == "success"
+            ' <<< "$runs" >/dev/null
+          fi
+          checks="$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100")"
+          jq -e '
+            .total_count > 0 and
+            .total_count == (.check_runs | length) and
+            ([.check_runs[] | select(.name != "Auto merge")] | length) > 0 and
+            all(.check_runs[] | select(.name != "Auto merge");
+              .status == "completed" and
+              (.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped"))
+          ' <<< "$checks" >/dev/null
+          pr_base="$(gh pr view "$pr" --repo "$REPO" --json baseRefOid --jq .baseRefOid)"
+          main_base="$(gh api "repos/$REPO/branches/main" --jq .commit.sha)"
+          if [[ "$pr_base" != "$main_base" ]]; then
+            gh pr update-branch "$pr" --repo "$REPO"
+            echo "PR atualizado contra main; o merge aguarda os novos checks."
+            exit 0
+          fi
+          gh pr merge "$pr" --repo "$REPO" --squash
+          gh workflow run ci.yml --repo "$REPO" --ref main
+          if [[ "$image_required" == true ]]; then
+            gh workflow run imagem.yml --repo "$REPO" --ref main
+          fi

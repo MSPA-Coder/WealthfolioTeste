@@ -3,8 +3,8 @@ name: Imagem
 # Constrói a imagem que o VPS roda, a partir do upstream fixado e de
 # `patches/`, e roda os testes do upstream nos módulos que os patches mexem.
 # É lento (o servidor em Rust compila do zero), então só roda quando muda o
-# que entra na imagem. O cron mensal confirma que as imagens-base fixadas e o
-# crates.io ainda servem o que o build pede.
+# que entra na imagem. O cron semanal puxa as tags móveis das imagens-base e
+# verifica se o crates.io ainda serve o que o build pede.
 on:
   push:
     branches: [main]
@@ -13,7 +13,7 @@ on:
     paths: [Dockerfile, .dockerignore, "patches/**", .github/workflows/imagem.yml]
   workflow_dispatch:
   schedule:
-    - cron: "41 4 1 * *"
+    - cron: "0 6 * * 2"
 
 permissions:
   contents: read
@@ -31,11 +31,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Testes do upstream nos módulos dos patches
-        run: docker build --target testes .
+        run: docker build --pull --target testes .
 
       # Reaproveita as camadas do passo anterior: só a imagem final é nova.
       - name: Imagem final
-        run: docker build -t wealthfolio-teste:ci .
+        run: docker build --pull -t wealthfolio-teste:ci .
 
       # Sobe como no VPS: banco cifrado exigido, chave mestra por arquivo,
       # sistema de arquivos só de leitura e as mesmas restrições do compose.yaml
@@ -65,3 +65,19 @@ jobs:
           done
           docker logs wf | tail -50
           exit 1
+
+      - name: Varredura de vulnerabilidade da imagem final
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/trivy-cache"
+          chmod 777 "$RUNNER_TEMP/trivy-cache"
+          docker save wealthfolio-teste:ci -o "$RUNNER_TEMP/imagem.tar"
+          chmod 644 "$RUNNER_TEMP/imagem.tar"
+          docker compose -f .github/docker-compose.yml run --rm trivy \
+            --cache-dir /tmp/trivy-cache \
+            image --input /varredura/imagem.tar \
+                  --scanners vuln \
+                  --severity HIGH,CRITICAL \
+                  --ignore-unfixed \
+                  --exit-code 1 \
+                  --format table
