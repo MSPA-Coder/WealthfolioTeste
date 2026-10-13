@@ -1,9 +1,21 @@
-# Plano de execução: CB + CRV + Wealthfolio e retirada do NetWorth
+# Registro de execução: CB + CRV + Wealthfolio e retirada do NetWorth
 
-**Estado:** em execução com autorização explícita do mantenedor. A retirada do
-NetWorth continua condicionada ao Gate D.
+**Estado:** plano encerrado em 12/10/2026. A integração CB + CRV + Wealthfolio
+continua em operação; o serviço e os arquivos NetWorth foram removidos.
 
-**Decisão:** Controle Bancário (CB) e Controle de Renda Variável (CRV) continuam como fontes operacionais de verdade. Wealthfolio v3.9.1, iniciado sem dados, passa a ser a interface gerencial. NetWorth é um experimento nunca usado em produção; será preservado apenas como repositório e referência até a primeira operação comprovada do Wealthfolio e então removido do VPS.
+**Decisão atual:** Controle Bancário (CB) e Controle de Renda Variável (CRV)
+continuam como fontes operacionais de verdade; Wealthfolio é a interface
+gerencial. NetWorth foi aposentado em 29/09/2026. Os registros divergem sobre
+se chegou a receber dados reais, então este documento não afirma que nunca foi
+produtivo. Em 12/10/2026, após autorização do mantenedor, foram removidos o
+checkout local, o repositório GitHub, 33 dumps, 3 ZIPs, 36 manifestos e os
+registros NetWorth do catálogo local. A integridade do catálogo foi confirmada
+com `ok`. A inspeção não encontrou serviço, imagem, volume, timer ou backup
+NetWorth no VPS. O Wealthfolio é servido em
+`wealthfolio-mspa.duckdns.org` pelo vhost `wealthfolio`, com proxy para a porta
+18088. O hostname histórico `networth-mspa.duckdns.org` e o vhost `networth`
+foram retirados depois da migração; o volume `wealthfolio-teste-data` continua
+em uso.
 
 ## 1. Limites de responsabilidade
 
@@ -12,7 +24,7 @@ NetWorth continua condicionada ao Gate D.
 | CB | contas, lançamentos, recorrências, transferências e projeção de caixa | gravar dados no Wealthfolio |
 | CRV | posições, cotações, proventos recebidos e movimentos | gravar dados no Wealthfolio |
 | Wealthfolio | leitura gerencial de patrimônio, alocação e acompanhamento de snapshots | lançamento operacional, replicação de fatos de caixa e trades |
-| NetWorth | referência de código durante a retirada | receber dados reais, desenvolver telas ou manter serviço ativo depois do aceite |
+| NetWorth | sistema aposentado e removido; histórico registrado neste documento | reativar o serviço ou receber novos dados |
 
 O conector usa snapshots. Ele não cria atividades de compra, venda, dividendo ou transferência no Wealthfolio. Ausência de cobertura é exibida como ausência; nunca é convertida em zero. CB e CRV são fontes separadas: a consolidação deve registrar a data e a idade de cada fonte, pois não existe uma transação distribuída entre as duas bases.
 
@@ -114,22 +126,35 @@ Esses ajustes são uma mudança de infraestrutura versionada. Eles serão implem
 1. Usar Wealthfolio como painel gerencial para consultas reais, mantendo toda digitação no CB e no CRV.
 2. Monitorar erros de sincronização, atrasos, divergências e saúde dos contêineres.
 3. Corrigir apenas defeitos encontrados no fluxo observado, cada um seguindo o processo de pares abaixo.
-4. Manter o NetWorth sem receber dados reais e sem novas funcionalidades.
+4. Durante esta fase, o NetWorth permaneceu sem novas funcionalidades.
 
 **Gate D:** pelo menos uma conciliação operacional real concluída e o Wealthfolio é considerado utilizável como painel gerencial.
 
-### Fase E — retirada do NetWorth de teste
+### Fase E — retirada do serviço NetWorth (concluída em 12/10/2026)
 
-Esta fase fica autorizável depois do Gate D, pois o NetWorth não contém histórico nem fluxo de produção a migrar.
+- A auditoria não encontrou aplicação, contêiner, imagem, volume, timer ou
+  backup remoto NetWorth no VPS. O Wealthfolio está ativo na porta 18088.
+- O checkout local e o repositório GitHub foram removidos. Também foram
+  removidos os 72 arquivos nas pastas de backup `projects/networth` e
+  `projects/networth_vps`, além dos respectivos registros de artefatos,
+  execuções e eventos do catálogo; a integridade SQLite foi confirmada.
+- Na conclusão desta fase, o vhost `networth` e o hostname
+  `networth-mspa.duckdns.org` ainda atendiam ao Wealthfolio. A fase seguinte
+  registra a migração do serviço para o hostname próprio.
+- Os timers específicos do NetWorth não estavam instalados. Nenhum recurso
+  compartilhado de Wealthfolio foi removido.
 
-1. Inventariar serviço Compose, proxy reverso, volumes, timers, variáveis e DNS associados ao NetWorth no VPS.
-2. Criar um backup pontual verificável do banco de teste, se ele existir, e preservar o repositório Git, `LICENSE` e `NOTICE.md`.
-3. Remover o vhost do NetWorth do bundle de Nginx, executar a validação oficial do Nginx e parar a stack sem usar `down -v`.
-4. Desabilitar `atualizar-cambio.timer` e `registrar-foto.timer` e confirmar que o instalador central não recriará o vhost ou os timers.
-5. Conferir que CB, CRV e Wealthfolio não referenciam hostname, token, volume ou timer do NetWorth.
-6. Manter contêineres parados e volumes identificados por sete dias como janela de reversão técnica. Depois de nova inspeção por nome e labels, remover contêineres e volumes; revogar credenciais de integração caso existam. Certificados compartilhados somente são removidos depois de confirmar seus consumidores.
+### Fase F — hostname próprio do Wealthfolio (concluída em 12/10/2026)
 
-**Critério de retirada:** Gate D aprovado + inventário sem consumidores + backup pontual concluído. A retirada de tráfego e timers acontece no aceite; a exclusão irreversível dos volumes ocorre depois de sete dias. Não há janela mínima de migração porque o NetWorth jamais foi produtivo.
+- O hostname `wealthfolio-mspa.duckdns.org` aponta para o IP público da VPS e
+  é servido pelo vhost `wealthfolio`, com proxy para `127.0.0.1:18088`.
+- O domínio histórico `networth-mspa.duckdns.org` e o vhost `networth` foram
+  desativados; não há redirecionamento ou alias legado.
+- `WF_CORS_ALLOW_ORIGINS` foi atualizado para o hostname novo. O volume
+  `wealthfolio-teste-data` permaneceu intacto.
+
+Não há cópias locais ou remotas de código ou dados do NetWorth para reversão.
+Uma eventual retomada exigirá uma decisão própria e novo desenvolvimento.
 
 ## 5. Funcionalidade futura: projeção consolidada
 
@@ -175,16 +200,21 @@ Para reduzir corridas, agentes não editam o mesmo repositório ou arquivo em pa
 | Wealthfolio falha | parar somente o Compose do Wealthfolio; preservar volume e chave para análise |
 | Rede interna falha | restaurar override anterior dos serviços; não abrir APIs públicas como correção rápida |
 | Conciliação não fecha | manter Wealthfolio somente em observação; não editar dados para forçar igualdade |
-| Retirada do NetWorth encontra dependência | restaurar serviço a partir do inventário e adiar exclusão |
+| Uma dependência histórica do NetWorth reaparece | não há artefato para restaurar; avaliar uma implementação nova e preservar os serviços atuais do Wealthfolio |
 
 Os testes são executados exclusivamente pelos serviços Docker e comandos oficiais de cada repositório. A ficha de implantação deve separar verificações de configuração, build, health check, sincronização, conciliação e rollback.
 
-## 8. Aprovação necessária antes de executar
+## 8. Aprovações do plano original (histórico)
+
+Os itens abaixo registram as aprovações que eram necessárias antes da execução
+original; não há gate pendente para a retirada, já concluída.
 
 A aprovação final deve confirmar:
 
 - início da Fase A e B no ambiente alvo;
 - janela para aplicar Compose e proxy no VPS;
 - uso de dados reais de CB e CRV somente na conciliação dirigida;
-- retirada do NetWorth depois do Gate D;
-- manutenção do repositório NetWorth e seus avisos de licença após a retirada do serviço.
+- retirada do serviço NetWorth depois do Gate D, concluída em 12/10/2026;
+- preservação temporária do checkout e do repositório como referência, decisão
+  supersedida em 12/10/2026 pela autorização para remover o projeto. O GitHub,
+  o checkout, os backups e seus registros no catálogo foram removidos.
