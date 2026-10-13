@@ -1,7 +1,8 @@
 # Wealthfolio greenfield
 
-Isolated Wealthfolio web installation built from Wealthfolio `v3.9.1` with the
-local network-broker extension required for the CB and CRV APIs.
+Isolated Wealthfolio web installation built from the latest tested stable
+upstream release with the local network-broker extension required for the CB
+and CRV APIs.
 It starts with a new, exclusive Docker volume and does not use the reference
 installation's `wealthfolio-data` volume. The web interface is published only
 on this computer at <http://127.0.0.1:18088>.
@@ -25,16 +26,16 @@ included here.
 The named volume is `wealthfolio-teste-data`. This project does not attach to,
 rename, or migrate data from the reference installation. The official image
 configuration and self-hosting requirements are documented in the upstream
-[`compose.yml`](https://github.com/wealthfolio/wealthfolio/blob/v3.9.1/compose.yml)
-and [self-hosting guide](https://github.com/wealthfolio/wealthfolio/blob/v3.9.1/docs/self-host/README.md).
+[`compose.yml`](https://github.com/wealthfolio/wealthfolio/blob/main/compose.yml)
+and [self-hosting guide](https://github.com/wealthfolio/wealthfolio/blob/main/docs/self-host/README.md).
 
 The integration contract used by the publishers and the connector is in
 [`docs/patrimonio-v4.md`](docs/patrimonio-v4.md).
 
 ## Local source APIs
 
-This Compose file builds Wealthfolio from the upstream v3.9.1 commit pinned
-in the `Dockerfile`, plus the patches in `patches/` (see "Build e patches"
+This Compose file builds Wealthfolio from the last tested upstream release
+commit pinned in the `Dockerfile`, plus the patches in `patches/` (see "Build e patches"
 below). Patch 0000 makes that build accept only exact
 `http://host:port/patrimonio/v4` values in
 `WF_ADDON_NETWORK_PRIVATE_TARGETS`, only `GET` requests, and only addons that
@@ -96,7 +97,7 @@ handler, network broker limits, storage limits and permission guards), with no
 network and no writes to CB, CRV or Wealthfolio:
 
 ```powershell
-docker compose -f compose.addon-sim.yaml run --rm addon-sim
+docker compose -f addons/controle-patrimonial-sync/compose.yaml run --rm addon-sim
 ```
 
 The simulation compiles the addon with the `esbuild` from `node_modules`, so
@@ -114,7 +115,7 @@ clicking **Importar agora**; the previous runtime stays loaded until then.
 Build the installable ZIP without Node.js on the host:
 
 ```powershell
-docker compose -f compose.addon-build.yaml run --rm addon-build
+docker compose -f addons/controle-patrimonial-sync/build/compose.yaml run --rm addon-build
 ```
 
 The resulting
@@ -138,9 +139,10 @@ the HTTPS reverse proxy.
 ## Build e patches
 
 A imagem sai do `Dockerfile` deste repositório, sem nenhuma pasta fora do Git.
-Ele baixa o Wealthfolio no commit fixado da tag v3.9.1 (`WEALTHFOLIO_COMMIT`),
+Ele baixa o Wealthfolio no commit da release validada (`WEALTHFOLIO_COMMIT`),
 aplica os arquivos de `patches/` na ordem do nome e compila com as mesmas
-etapas do Dockerfile do upstream, com as imagens-base fixadas por digest.
+etapas do Dockerfile do upstream. As tags móveis das imagens-base são
+reconstruídas e testadas semanalmente.
 O `git apply` não tem tolerância de espaço: patch que não casa exato para o
 build.
 
@@ -163,7 +165,9 @@ aplicam no commit fixado, roda a simulação do add-on e valida o Compose. O
 `imagem.yml` constrói a imagem, roda os testes do upstream nos módulos que os
 patches mexem (`docker build --target testes .`) e sobe a imagem até o
 `/api/v1/healthz` responder. Ele só roda quando o `Dockerfile` ou `patches/`
-mudam, e uma vez por mês.
+mudam, e também toda semana com `--pull` para validar as tags móveis das bases.
+`upstream.yml` consulta semanalmente a última release estável do Wealthfolio,
+abre um PR com o commit correspondente e dispara os dois workflows de teste.
 
 Para criar ou alterar um patch, parta do mesmo ponto que o build:
 
@@ -176,15 +180,19 @@ git add -A && git commit -qm "patches atuais"
 git diff > ../WealthfolioTeste/patches/0007-<nome>.patch
 ```
 
-Para subir de versão, troque `WEALTHFOLIO_COMMIT` pelo commit da tag nova,
-confira que os patches ainda aplicam e compare as etapas do `Dockerfile` com
-as do upstream nessa tag.
+O workflow `upstream.yml` verifica a última release estável uma vez por semana.
+Ele abre um PR que atualiza `WEALTHFOLIO_COMMIT`; os testes confirmam que os
+patches aplicam, os módulos afetados passam e a imagem sobe com health check e
+scan de vulnerabilidades. A automação integra somente o commit exato aprovado
+por esses checks.
 
 ### Implantar uma mudança de patch no VPS
 
 Publique por branch, pull request com checks obrigatórios verdes e squash merge.
 O checkout do VPS é somente um espelho do `main`: não faça `git pull`, build ou
-commit manual nele. Depois do merge, execute uma única operação:
+commit manual nele. O timer central verifica diariamente commits com CI verde
+e reconstrói semanalmente as tags-base móveis depois dos testes de imagem. Para
+uma atualização imediata depois do merge, execute:
 
 ```bash
 ~/deploy.sh wealthfolio
@@ -195,10 +203,10 @@ aguarda o contêiner e confirma a saúde pelo endereço público. Em falha poste
 ao fast-forward, restaura o commit e a imagem anteriores. `~/deploy.sh --status`
 continua disponível apenas para diagnóstico transversal.
 
-Antes de uma mudança que migre ou transforme dados, faça backup verificado pelo
-fluxo central e defina o retorno de schema/dados: o rollback do deploy não
-reverte o SQLite. Para uma mudança só de código ou patch, a cópia diária válida
-não deve ser refeita apenas como ritual.
+Antes de cada deploy ou reconstrução, o fluxo central exige backup verificado.
+O rollback restaura a imagem e o código anteriores, mas não reverte migrações
+ou gravações feitas no SQLite depois da troca; mantenha as migrações
+retrocompatíveis e trate transformações de dados com um procedimento próprio.
 
 Dois cuidados que custaram caro: o Wealthfolio não atualiza o MIC de um ativo
 que já existe, então mudar o MIC cria ativos novos e os antigos ficam sem

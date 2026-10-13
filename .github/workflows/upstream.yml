@@ -1,0 +1,69 @@
+name: Atualizar upstream Wealthfolio
+
+on:
+  schedule:
+    - cron: "15 5 * * 2"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-wealthfolio
+  cancel-in-progress: false
+
+jobs:
+  atualizar:
+    name: Propor release estável mais recente
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Criar PR e iniciar validação completa
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/wealthfolio/wealthfolio/releases/latest --jq .tag_name)"
+          [[ "$tag" =~ ^[[:alnum:]._-]+$ ]]
+          commit="$(gh api "repos/wealthfolio/wealthfolio/commits/$tag" --jq .sha)"
+          current="$(sed -n 's/^ARG WEALTHFOLIO_COMMIT=//p' Dockerfile)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          test -n "$current"
+          if [[ "$current" == "$commit" ]]; then
+            echo "A release estável $tag já está no branch principal."
+            exit 0
+          fi
+
+          branch=automation/wealthfolio-upstream
+          git switch --create "$branch"
+          sed -i "s/^ARG WEALTHFOLIO_COMMIT=.*/ARG WEALTHFOLIO_COMMIT=$commit/" Dockerfile
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Dockerfile
+          git commit -m "build: testar Wealthfolio $tag"
+          git push --force origin "$branch"
+
+          cat > "$RUNNER_TEMP/upstream-pr.md" <<EOF
+          Release estável detectada: $tag
+
+          Commit upstream: $commit
+
+          A atualização só pode ser integrada depois que CI e Imagem passarem no commit exato deste PR.
+          EOF
+          if gh pr view "$branch" --repo "$REPO" >/dev/null 2>&1; then
+            gh pr edit "$branch" --repo "$REPO" --title "build: testar Wealthfolio $tag" \
+              --body-file "$RUNNER_TEMP/upstream-pr.md"
+          else
+            gh pr create --repo "$REPO" --base main --head "$branch" \
+              --title "build: testar Wealthfolio $tag" --body-file "$RUNNER_TEMP/upstream-pr.md"
+          fi
+
+          # Pull requests criados por GITHUB_TOKEN não iniciam os workflows de
+          # PR automaticamente. Disparar ambos explicitamente mantém o gate.
+          gh workflow run ci.yml --repo "$REPO" --ref "$branch"
+          gh workflow run imagem.yml --repo "$REPO" --ref "$branch"

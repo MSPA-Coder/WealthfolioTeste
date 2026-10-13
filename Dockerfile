@@ -1,23 +1,25 @@
-# Wealthfolio 3.9.1 com os patches deste repositório, sem nenhuma pasta fora do Git.
+# Wealthfolio no último commit upstream validado, com os patches deste
+# repositório, sem nenhuma pasta fora do Git.
 #
 # Até 03/10/2026 o compose.yaml construía ../CodexTemp/wealthfolio-v3.9.1, uma
 # cópia do upstream com os patches aplicados à mão e mais uma extensão que não
 # estava versionada em lugar nenhum (hoje o patch 0000). Perder o VPS era
 # perder a única forma de reconstruir a imagem que roda. Aqui o código vem do
 # commit fixado da tag, os patches de `patches/` entram na ordem do nome, e o
-# resto repete o Dockerfile do upstream na v3.9.1, com as imagens-base fixadas
-# por digest. Upstream + 0000..0003 foi conferido igual, arquivo a arquivo, ao
+# resto repete o Dockerfile do upstream na v3.9.1. As tags das imagens-base
+# avançam dentro de suas linhas estáveis; builds semanais testam essas mudanças.
+# Upstream + 0000..0003 foi conferido igual, arquivo a arquivo, ao
 # CodexTemp que estava em produção.
 #
-# Para subir de versão: troque WEALTHFOLIO_COMMIT pelo commit da tag nova,
-# confira que os patches ainda aplicam e compare as etapas abaixo com o
-# Dockerfile do upstream nessa tag.
+# upstream.yml acompanha a última release estável e abre um PR para atualizar
+# WEALTHFOLIO_COMMIT; a CI confere os patches e os testes antes de integrar.
 
-# Tag v3.9.1 (objeto da tag: fa3cd85717ed47f448bcbd637e222c11234f9094).
+# O commit da última release estável é atualizado por upstream.yml e só entra
+# depois de os testes de patch, build, startup e CVE passarem.
 ARG WEALTHFOLIO_COMMIT=392f272c5b15a4af45dc2ff71dcbec474f47112a
 
 # Fonte: upstream no commit fixado + patches, ou o build para.
-FROM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 AS fonte
+FROM alpine:3.24 AS fonte
 RUN apk add --no-cache git
 ARG WEALTHFOLIO_COMMIT
 RUN git init -q /src \
@@ -32,7 +34,7 @@ RUN cd /src \
  && rm -rf .git
 
 # Front-end (Dockerfile do upstream, estágio 1).
-FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS frontend
+FROM --platform=$BUILDPLATFORM node:24-alpine AS frontend
 # Wealthfolio Connect desligado, como no build sem argumentos do upstream. As
 # duas variáveis existem vazias (e não ausentes) porque o servidor as lê na
 # compilação, onde vazia e ausente não são a mesma coisa.
@@ -44,13 +46,13 @@ WORKDIR /app
 COPY --from=fonte /src/ ./
 ENV CI=1
 ENV BUILD_TARGET=web
-RUN npm install -g pnpm@9.9.0 && pnpm install --frozen-lockfile
+RUN npm install -g pnpm@9 && pnpm install --frozen-lockfile
 RUN pnpm --filter frontend... build && mv dist /web-dist
 
 # Servidor (Dockerfile do upstream, estágio 2).
-FROM --platform=$BUILDPLATFORM tonistiigi/xx:1.7.0@sha256:010d4b66aed389848b0694f91c7aaee9df59a6f20be7f5d12e53663a37bd14e2 AS xx
+FROM --platform=$BUILDPLATFORM tonistiigi/xx:latest AS xx
 
-FROM --platform=$BUILDPLATFORM rust:1.98.1-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS backend
+FROM --platform=$BUILDPLATFORM rust:1-alpine AS backend
 COPY --from=xx / /
 ARG TARGETPLATFORM
 # Wealthfolio Connect desligado, como no build sem argumentos do upstream. As
@@ -93,9 +95,9 @@ COPY --from=fonte /src/apps/frontend/index.html ./apps/frontend/index.html
 RUN xx-cargo test --locked --release -p wealthfolio-core --lib addons::network \
  && xx-cargo test --locked --release -p wealthfolio-server --lib patrimonio_sync
 
-# Imagem final (Dockerfile do upstream, estágio 3). A base fica a mesma do
-# upstream, alpine:3.19, para a imagem não mudar além da origem do código.
-FROM alpine:3.19@sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1
+# Imagem final. Alpine recebe correções dentro da linha 3.24; o cron semanal
+# reconstrói com `--pull` e executa smoke, testes do upstream e Trivy.
+FROM alpine:3.24
 WORKDIR /app
 COPY --from=backend /wealthfolio-server /usr/local/bin/wealthfolio-server
 COPY --from=frontend /web-dist ./dist
