@@ -1,6 +1,6 @@
 // Confere o ZIP empacotado (release/) e executa o dist/addon.js DE DENTRO do ZIP
 // contra o host simulado pelo caminho automático (enable). Só imprime metadados.
-//   docker run --rm --network none -v <addon>:/workspace:ro -w /workspace node:24-alpine node sim/verify-package.mjs
+//   docker run --rm --network none -v <addon>:/workspace:ro -w /workspace node:26-alpine node sim/verify-package.mjs
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -23,7 +23,7 @@ const local = JSON.parse(readFileSync('manifest.json', 'utf8'));
 const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
 const dist = readFileSync(join(dir, 'dist/addon.js'), 'utf8');
 check('conteúdo do ZIP: manifest.json, dist/addon.js, README.md', ['manifest.json', 'dist/addon.js', 'README.md'].every((f) => listing.includes(f)) && listing.length === 3, listing.join(', '));
-check(`versão ${packed.version} igual em manifest.json, package.json e no ZIP`, packed.version === '0.4.0' && local.version === packed.version && pkg.version === packed.version);
+check(`versão ${packed.version} igual em manifest.json, package.json e no ZIP`, packed.version === '0.4.1' && local.version === packed.version && pkg.version === packed.version);
 check('manifesto do ZIP idêntico ao do repositório', JSON.stringify(packed) === JSON.stringify(local));
 const perms = packed.permissions.map((p) => `${p.category}.${p.functions.join('+')}`).join(', ');
 check('permissões: só secrets.set+use e network.request (o add-on não escreve no Wealthfolio)', perms === 'secrets.set+use, network.request', perms);

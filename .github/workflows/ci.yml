@@ -62,9 +62,9 @@ jobs:
       - name: Simulação do add-on e conferência do pacote
         run: |
           set -euo pipefail
-          imagem=node:24-alpine
+          imagem=node:26-alpine
           dir="$PWD/addons/controle-patrimonial-sync"
-          docker run --rm -v "$dir:/workspace" -w /workspace "$imagem" npm ci --no-audit --no-fund
+          docker compose --profile build -f addons/controle-patrimonial-sync/compose.yaml run --rm addon-build
           docker compose -f addons/controle-patrimonial-sync/compose.yaml run --rm addon-sim
           docker run --rm --network none -v "$dir:/workspace:ro" -w /workspace "$imagem" node sim/verify-package.mjs
 

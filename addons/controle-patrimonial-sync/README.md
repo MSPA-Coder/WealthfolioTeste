@@ -53,7 +53,7 @@ Requests use the private Docker HTTP aliases and send `X-Forwarded-Proto: https`
 matching CB's HTTPS-enforcement middleware and the server-side importer. The
 public apps remain behind their HTTPS proxy.
 
-Run `docker compose -f build/compose.yaml run --rm addon-build` from this
+Run `docker compose --profile build -f compose.yaml run --rm addon-build` from this
 directory to create `release/controle-patrimonial-sync.zip`. Install that
 ZIP from Wealthfolio Settings > Addons and approve only the literal hosts declared
 in `manifest.json`. After installing a new version, reload the Wealthfolio page.
