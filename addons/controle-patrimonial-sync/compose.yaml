@@ -11,3 +11,12 @@ services:
     volumes:
       - .:/workspace:ro
     command: ["node", "sim/run.mjs"]
+
+  addon-build:
+    image: node:26-alpine
+    pull_policy: always
+    profiles: [build]
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    command: ["sh", "-ec", "apk add --no-cache zip && npm ci --no-audit --no-fund && npm audit --audit-level=low --no-fund && npm run bundle"]

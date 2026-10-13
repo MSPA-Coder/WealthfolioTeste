@@ -115,7 +115,7 @@ clicking **Importar agora**; the previous runtime stays loaded until then.
 Build the installable ZIP without Node.js on the host:
 
 ```powershell
-docker compose -f addons/controle-patrimonial-sync/build/compose.yaml run --rm addon-build
+docker compose --profile build -f addons/controle-patrimonial-sync/compose.yaml run --rm addon-build
 ```
 
 The resulting
