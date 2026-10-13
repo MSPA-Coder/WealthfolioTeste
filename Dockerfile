@@ -34,7 +34,7 @@ RUN cd /src \
  && rm -rf .git
 
 # Front-end (Dockerfile do upstream, estágio 1).
-FROM --platform=$BUILDPLATFORM node:24-alpine AS frontend
+FROM --platform=$BUILDPLATFORM node:26-alpine AS frontend
 # Wealthfolio Connect desligado, como no build sem argumentos do upstream. As
 # duas variáveis existem vazias (e não ausentes) porque o servidor as lê na
 # compilação, onde vazia e ausente não são a mesma coisa.
