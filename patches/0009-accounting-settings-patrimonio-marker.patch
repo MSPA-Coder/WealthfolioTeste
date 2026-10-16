@@ -1,0 +1,64 @@
+diff --git a/crates/core/src/accounts/accounts_model.rs b/crates/core/src/accounts/accounts_model.rs
+index 72099cf..4ce405e 100644
+--- a/crates/core/src/accounts/accounts_model.rs
++++ b/crates/core/src/accounts/accounts_model.rs
+@@ -256,6 +256,9 @@ impl AccountAccountingSettings {
+     }
+ }
+ 
++/// Prefix of the plain-text `meta` marker of the accounts the CB/CRV import creates.
++const PATRIMONIO_META_MARKER: &str = "controlePatrimonial";
++
+ /// The entry of an account's `meta` that holds its accounting settings.
+ const ACCOUNTING_META_KEY: &str = "accounting";
+ 
+@@ -393,8 +396,18 @@ impl Account {
+             )))
+         };
+ 
+-        let meta = serde_json::from_str::<Value>(raw_meta)
+-            .map_err(|_| unreadable("its meta is not JSON"))?;
++        let meta = match serde_json::from_str::<Value>(raw_meta) {
++            Ok(meta) => meta,
++            // The CB/CRV import marks the accounts it creates with a plain-text
++            // `meta` (`controlePatrimonial:...`) that adoption matches by
++            // equality. Such an account has no accounting settings: defaults.
++            Err(_) if raw_meta.starts_with(PATRIMONIO_META_MARKER) => {
++                return Ok(AccountAccountingSettings::default_for_account(
++                    self.id.clone(),
++                ));
++            }
++            Err(_) => return Err(unreadable("its meta is not JSON")),
++        };
+         let Some(accounting) = meta.get(ACCOUNTING_META_KEY) else {
+             return Ok(AccountAccountingSettings::default_for_account(
+                 self.id.clone(),
+diff --git a/crates/core/src/accounts/accounts_model_tests.rs b/crates/core/src/accounts/accounts_model_tests.rs
+index f097607..d1f62c6 100644
+--- a/crates/core/src/accounts/accounts_model_tests.rs
++++ b/crates/core/src/accounts/accounts_model_tests.rs
+@@ -149,6 +149,24 @@ mod tests {
+         }
+     }
+ 
++    /// The CB/CRV import marks its accounts with a plain-text meta; they take
++    /// the defaults instead of being refused as unreadable.
++    #[test]
++    fn patrimonio_import_marker_reads_as_the_defaults() {
++        for meta in [
++            "controlePatrimonial:cb:account:1",
++            "controlePatrimonial:crv:xp:principal:BRL",
++        ] {
++            let settings = accounting_settings_of(Some(meta))
++                .unwrap_or_else(|error| panic!("{meta:?}: {error}"));
++            assert_eq!(
++                settings.cost_basis_method,
++                AccountAccountingSettings::default_for_account("acc").cost_basis_method
++            );
++        }
++        assert!(accounting_settings_of(Some("otherPlainText")).is_err());
++    }
++
+     /// Engine rules R7.2: settings this version cannot read are an error for
+     /// their account, never the defaults.
+     #[test]
