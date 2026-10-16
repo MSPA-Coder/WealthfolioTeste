@@ -1,31 +1,8 @@
-Extensão do broker de rede dos add-ons: alvos locais exatos e só leitura.
-
-O Wealthfolio 3.9.1 recusa qualquer endereço privado no broker de rede dos
-add-ons ("Addon network host resolves to a private address"). O add-on e a
-sincronização do servidor (0001) leem o CB e o CRV pela rede Docker interna
-(cb-api, crv-api), então precisam desta exceção.
-
-WF_ADDON_NETWORK_PRIVATE_TARGETS lista URLs exatas http://host:porta/patrimonio/v4.
-Cada uma libera só GET nessa origem e nesse caminho (ou abaixo dele), com o host
-declarado literalmente no add-on, endereço resolvido privado e sem proxy. Sem a
-variável, nada muda em relação ao upstream.
-
-Esta extensão existia só na pasta CodexTemp do VPS1. Foi extraída em 03/10/2026
-pela diferença entre o CodexTemp e o upstream v3.9.1 (392f272), descontados os
-patches 0001 a 0003. Vem antes deles porque o 0001 comenta a mesma variável no
-compose.yml.
-
-Correção do teste (03/10/2026): `local_targets_are_restricted_to_exact_http_origin_and_api_path`
-esperava erro em validate_url para https na mesma origem, mas o https segue o caminho
-comum (alvo local = false) e quem o recusa é resolve_addresses, que rejeita endereço
-privado. O teste reprovava contra o próprio código; agora afirma o comportamento real.
-Só o módulo de testes mudou; o código compilado é o mesmo que roda em produção.
-
 diff --git a/compose.yml b/compose.yml
-index 4428794..acb6829 100644
+index 86cf07d..8d8d1f1 100644
 --- a/compose.yml
 +++ b/compose.yml
-@@ -24,6 +24,8 @@ services:
+@@ -27,6 +27,8 @@ services:
        WF_SECRET_KEY_FILE: "${WF_SECRET_KEY_FILE:-}"
        # Startup requirement; convert existing databases offline before enabling.
        WF_DB_REQUIRE_ENCRYPTION: "${WF_DB_REQUIRE_ENCRYPTION:-0}"
@@ -417,12 +394,12 @@ index a21f50b..b4b569e 100644
  
      #[test]
 diff --git a/docs/addons/addon-api-reference.md b/docs/addons/addon-api-reference.md
-index e791a5e..6c3dc46 100644
+index 4fc2298..055ea6b 100644
 --- a/docs/addons/addon-api-reference.md
 +++ b/docs/addons/addon-api-reference.md
-@@ -1276,6 +1276,25 @@ Prefer brokered `ctx.api.network.request()` over reading a secret into addon
- JavaScript. The request host must be declared in `network.allowedHosts` and its
- response body is text, not a binary transport.
+@@ -1281,6 +1281,25 @@ approved while the dev runtime is active. Successfully loaded dev addons take
+ precedence over an installed copy of the same addon. If dev activation fails,
+ its authorization is removed before the installed copy can load.
  
 +By default, the network broker permits only HTTPS and rejects private, loopback,
 +link-local, and metadata-service addresses. A Wealthfolio host can explicitly
