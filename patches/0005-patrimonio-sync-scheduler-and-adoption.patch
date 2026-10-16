@@ -1,8 +1,8 @@
 diff --git a/apps/server/src/api.rs b/apps/server/src/api.rs
-index 3138ae5..7f081a9 100644
+index b844845..3c40ba7 100644
 --- a/apps/server/src/api.rs
 +++ b/apps/server/src/api.rs
-@@ -52,7 +52,7 @@ mod holdings;
+@@ -54,7 +54,7 @@ mod holdings;
  mod limits;
  mod market_data;
  mod net_worth;
@@ -1157,10 +1157,10 @@ index 29a256e..356b457 100644
 +    }
  }
 diff --git a/apps/server/src/profiles.rs b/apps/server/src/profiles.rs
-index b4e2ecf..f8a8261 100644
+index 3392314..2224127 100644
 --- a/apps/server/src/profiles.rs
 +++ b/apps/server/src/profiles.rs
-@@ -309,20 +309,26 @@ impl WebProfiles {
+@@ -330,20 +330,26 @@ impl WebProfiles {
      pub fn start_connected_profiles(self: &Arc<Self>) {
          let root = self.clone();
          tokio::spawn(async move {
@@ -1200,16 +1200,16 @@ index b4e2ecf..f8a8261 100644
                          if let Err((status, _)) = root.runtime(profile.id).await {
                              tracing::warn!(%status, "Profile sync startup deferred");
 diff --git a/apps/server/src/scheduler.rs b/apps/server/src/scheduler.rs
-index aafac3d..ae47578 100644
+index e454cba..206d160 100644
 --- a/apps/server/src/scheduler.rs
 +++ b/apps/server/src/scheduler.rs
-@@ -181,6 +181,9 @@ pub fn start_background_workers(state: Arc<AppState>) {
+@@ -195,6 +195,9 @@ pub fn start_background_workers(state: Arc<AppState>) {
      // Start background broker sync scheduler (4-hour interval)
      start_broker_sync_scheduler(state.clone());
  
 +    // CB/CRV patrimonio import (opt-in through WF_PATRIMONIO_SYNC_INTERVAL_SECS)
 +    crate::api::patrimonio_sync::start_scheduler(state.clone());
 +
-     // Start periodic market data sync (6h interval, 2min initial delay)
-     let quote_svc = state.quote_service.clone();
-     let worker = tokio::spawn(async move {
+     // Periodic market data sync plus portfolio update (6h interval, 2min
+     // initial delay): the coordinator rebuilds whatever the sync made stale.
+     let worker = crate::api::shared::spawn_periodic_update(state.clone());
