@@ -12,7 +12,7 @@ services:
       - no-new-privileges:true
     pids_limit: 256
     tmpfs:
-      - /tmp:rw,noexec,nosuid,size=256m
+      - /tmp:rw,noexec,nosuid,size=1g
     volumes:
       - type: bind
         source: ${RUNNER_TEMP:?RUNNER_TEMP must be set}
