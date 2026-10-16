@@ -171,6 +171,8 @@ patches mexem (`docker build --target testes .`) e sobe a imagem até o
 mudam, e também toda semana com `--pull` para validar as tags móveis das bases.
 `upstream.yml` consulta semanalmente a última release estável do Wealthfolio,
 abre um PR com o commit correspondente e dispara os dois workflows de teste.
+As validações proporcionais a cada tipo de mudança, os comandos oficiais e os
+limites de concorrência estão em [`docs/operacao.md`](docs/operacao.md).
 
 Para criar ou alterar um patch, parta do mesmo ponto que o build:
 
