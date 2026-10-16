@@ -154,7 +154,10 @@ build.
 | `0003-fix-patrimonio-account-id-linkage` | Vínculo do id da conta entre o snapshot e a conta criada. |
 | `0004-crv-market-to-mic` | Traduz o mercado do CRV (`B3`, `NYSE`, `NASDAQ`) para o MIC que o Wealthfolio usa para achar o sufixo do Yahoo (`BVMF`, `XNYS`, `XNAS`). Sem isso, as ações da B3 pediam o ticker puro e davam 404. |
 | `0005-patrimonio-sync-scheduler-and-adoption` | Importação agendada pelo servidor, com um só mapeamento: adota as contas que o add-on criou, ignora as arquivadas, importa a cada 15 minutos (com atalho pelo feed de mudanças e foto garantida a cada dia) e abre o perfil na partida. Inclui o mapeamento de mercado do 0004. |
-| `0006-patrimonio-sync-run-log` | Uma linha de log por execução da importação (`Patrimonio sync run finished: cb=ready crv=ready`), boa ou má. Antes, uma execução bem-sucedida não deixava rastro, e o vigia não distinguia importador vivo de importador parado. |
+| `0006-repair-crv-asset-metadata` | Importa as posições do CRV sem fixar o id sintético do ativo, para o serviço de snapshots resolver a chave canônica (símbolo, MIC, moeda) e reparar ativos antigos sem metadados. |
+| `0007-patrimonio-cron-scheduler` | Agenda a importação por expressão cron (`WF_PATRIMONIO_SYNC_CRON`, fuso America/Sao_Paulo), com o intervalo antigo como alternativa. |
+| `0008-patrimonio-sync-run-log` | Uma linha de log por execução da importação (`Patrimonio sync run finished: cb=ready crv=ready`), boa ou má. Antes, uma execução bem-sucedida não deixava rastro, e o vigia não distinguia importador vivo de importador parado. |
+| `0009-accounting-settings-patrimonio-marker` | A partir da 3.10, as configurações contábeis da conta são lidas de `account.meta` e `meta` que não é JSON vira erro (a conta fica sem resultados). As contas do import usam o marcador em texto puro `controlePatrimonial:...`; este patch o lê como configuração padrão. |
 
 Até 03/10/2026 o build usava `../CodexTemp/wealthfolio-v3.9.1`, uma cópia do
 upstream com os patches aplicados à mão. O 0000 só existia lá. Upstream mais

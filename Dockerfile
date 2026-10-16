@@ -94,6 +94,7 @@ FROM backend AS testes
 COPY --from=fonte /src/tests ./tests
 COPY --from=fonte /src/apps/frontend/index.html ./apps/frontend/index.html
 RUN xx-cargo test --locked --release -p wealthfolio-core --lib addons::network \
+ && xx-cargo test --locked --release -p wealthfolio-core --lib accounts::accounts_model_tests \
  && xx-cargo test --locked --release -p wealthfolio-server --lib patrimonio_sync
 
 # Imagem final. Alpine recebe correções dentro da linha 3.24; o cron semanal
