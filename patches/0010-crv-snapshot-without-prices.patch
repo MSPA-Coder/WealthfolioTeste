@@ -1,0 +1,48 @@
+diff --git a/apps/server/src/api/patrimonio_sync.rs b/apps/server/src/api/patrimonio_sync.rs
+index dba5c131..4626bc34 100644
+--- a/apps/server/src/api/patrimonio_sync.rs
++++ b/apps/server/src/api/patrimonio_sync.rs
+@@ -197,6 +197,17 @@ fn failure_state(error: &str) -> &'static str {
+     }
+ }
+ 
++/// The CRV snapshot carries the whole price history, which grows every day and
++/// passed the 2 MiB addon-network response limit on 2026-10-16. The importer
++/// only reads accounts and holdings, so it asks the CRV to leave the history out.
++fn snapshot_url(source: Source) -> String {
++    if source.id == "crv" {
++        format!("{}/snapshot?include_prices=false", source.base_url)
++    } else {
++        format!("{}/snapshot", source.base_url)
++    }
++}
++
+ async fn sync_source(
+     state: &AppState,
+     source: Source,
+@@ -241,7 +252,7 @@ async fn sync_source(
+ 
+     let (_, snapshot) = request_json(
+         source,
+-        format!("{}/snapshot", source.base_url),
++        snapshot_url(source),
+         authorization.as_deref(),
+     )
+     .await?;
+@@ -1159,6 +1170,16 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn only_the_crv_snapshot_omits_the_price_history() {
++        let [cb, crv] = SOURCES;
++        assert_eq!(snapshot_url(cb), "http://cb-api:8000/patrimonio/v4/snapshot");
++        assert_eq!(
++            snapshot_url(crv),
++            "http://crv-api:5003/patrimonio/v4/snapshot?include_prices=false"
++        );
++    }
++
+     #[test]
+     fn crv_markets_map_to_the_mic_the_quote_resolver_knows() {
+         assert_eq!(market_to_mic("B3"), "BVMF");

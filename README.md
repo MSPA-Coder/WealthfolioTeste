@@ -158,6 +158,7 @@ build.
 | `0007-patrimonio-cron-scheduler` | Agenda a importação por expressão cron (`WF_PATRIMONIO_SYNC_CRON`, fuso America/Sao_Paulo), com o intervalo antigo como alternativa. |
 | `0008-patrimonio-sync-run-log` | Uma linha de log por execução da importação (`Patrimonio sync run finished: cb=ready crv=ready`), boa ou má. Antes, uma execução bem-sucedida não deixava rastro, e o vigia não distinguia importador vivo de importador parado. |
 | `0009-accounting-settings-patrimonio-marker` | A partir da 3.10, as configurações contábeis da conta são lidas de `account.meta` e `meta` que não é JSON vira erro (a conta fica sem resultados). As contas do import usam o marcador em texto puro `controlePatrimonial:...`; este patch o lê como configuração padrão. |
+| `0010-crv-snapshot-without-prices` | O snapshot do CRV traz o histórico inteiro de cotações, que cresce todo dia e passou de 2 MiB (limite de resposta do broker de rede) em 16/10/2026; o importador do servidor só lê contas e posições e falhava com "indisponível ou fora da allowlist". Passa a pedir `/snapshot?include_prices=false` ao CRV. |
 
 Até 03/10/2026 o build usava `../CodexTemp/wealthfolio-v3.9.1`, uma cópia do
 upstream com os patches aplicados à mão. O 0000 só existia lá. Upstream mais
