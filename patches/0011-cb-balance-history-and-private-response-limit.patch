@@ -1,0 +1,299 @@
+diff --git a/apps/server/src/api/patrimonio_sync.rs b/apps/server/src/api/patrimonio_sync.rs
+index 4626bc34..faa3be6a 100644
+--- a/apps/server/src/api/patrimonio_sync.rs
++++ b/apps/server/src/api/patrimonio_sync.rs
+@@ -362,6 +362,131 @@ struct SyncedAccount {
+     currency: String,
+ }
+ 
++const CB_HISTORY_KEY_PREFIX: &str = "patrimonio_sync_cb_history_";
++
++/// Realized cash movements of one CB account as (date, signed amount): income
++/// adds and expense subtracts. Planned or overdue entries are not movements yet.
++fn realized_movements(items: &[Value], account_source_id: &str) -> Vec<(NaiveDate, Decimal)> {
++    items
++        .iter()
++        .filter(|item| item.get("resource").and_then(Value::as_str) == Some("cash_entry"))
++        .filter_map(|item| item.get("payload"))
++        .filter(|payload| {
++            payload.get("account_id").and_then(Value::as_str) == Some(account_source_id)
++                && payload.get("status").and_then(Value::as_str) == Some("realizado")
++        })
++        .filter_map(|payload| {
++            let date = payload
++                .get("realized_date")
++                .and_then(Value::as_str)
++                .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())?;
++            let amount = payload
++                .get("realized_amount")
++                .and_then(Value::as_str)
++                .and_then(|amount| amount.parse::<Decimal>().ok())?;
++            match payload.get("entry_type").and_then(Value::as_str) {
++                Some("receita") => Some((date, amount)),
++                Some("despesa") => Some((date, -amount)),
++                _ => None,
++            }
++        })
++        .collect()
++}
++
++/// Running cash balance on every day the balance changed, from the opening
++/// balance to `through`. Returns None unless the result ends exactly at
++/// `expected_final`: a history that does not reproduce the balance the source
++/// publishes is not written. Whether movements dated on the opening day are
++/// already inside the opening balance is not part of the contract, so both
++/// readings are tried and the one that reproduces the balance wins.
++fn balance_history(
++    initial: Decimal,
++    initial_date: NaiveDate,
++    movements: &[(NaiveDate, Decimal)],
++    through: NaiveDate,
++    expected_final: Decimal,
++) -> Option<Vec<(NaiveDate, Decimal)>> {
++    for include_opening_day in [false, true] {
++        let mut by_day: BTreeMap<NaiveDate, Decimal> = BTreeMap::new();
++        for (date, amount) in movements {
++            let counts = *date <= through
++                && if include_opening_day {
++                    *date >= initial_date
++                } else {
++                    *date > initial_date
++                };
++            if counts {
++                *by_day.entry(*date).or_insert(Decimal::ZERO) += *amount;
++            }
++        }
++        let mut balance = initial;
++        let mut series = vec![(initial_date, balance)];
++        for (date, delta) in by_day {
++            balance += delta;
++            if date == initial_date {
++                series[0] = (date, balance);
++            } else {
++                series.push((date, balance));
++            }
++        }
++        if balance == expected_final {
++            return Some(series);
++        }
++    }
++    None
++}
++
++fn history_digest(series: &[(NaiveDate, Decimal)]) -> String {
++    let mut hasher = Sha256::new();
++    for (date, balance) in series {
++        hasher.update(format!("{date}={balance};"));
++    }
++    format!("{:x}", hasher.finalize())
++}
++
++fn history_digest_key(source_id: &str) -> String {
++    let mut hasher = Sha256::new();
++    hasher.update(source_id.as_bytes());
++    format!("{:x}", hasher.finalize())[..16].to_string()
++}
++
++/// Writes the daily balance history of one CB account. A digest of the series
++/// is kept per account, so an import with no change in the past writes nothing.
++async fn backfill_cb_history(
++    state: &AppState,
++    account_id: &str,
++    currency: &str,
++    source_id: &str,
++    series: &[(NaiveDate, Decimal)],
++) -> Result<usize, String> {
++    let digest = history_digest(series);
++    let key = format!("{CB_HISTORY_KEY_PREFIX}{}", history_digest_key(source_id));
++    let stored = state.settings_service.get_setting_value(&key).ok().flatten();
++    if stored.as_deref() == Some(digest.as_str()) {
++        return Ok(0);
++    }
++    for (date, balance) in series {
++        save_source_snapshot(
++            state,
++            account_id,
++            currency,
++            *date,
++            Vec::new(),
++            vec![CashBalanceInput {
++                currency: currency.to_string(),
++                amount: *balance,
++            }],
++        )
++        .await?;
++    }
++    state
++        .settings_service
++        .set_setting_value(&key, &digest)
++        .await
++        .map_err(|_| "Não foi possível salvar o controle do histórico do CB.".to_string())?;
++    Ok(series.len())
++}
++
+ async fn sync_cb_accounts(
+     state: &AppState,
+     snapshot: &Value,
+@@ -449,6 +574,29 @@ async fn sync_cb_accounts(
+         )
+         .await?;
+         accounts_synced += 1;
++        let current_balance = parse_decimal(balance, "saldo CB")?;
++        let initial = payload
++            .get("initial_balance")
++            .and_then(Value::as_str)
++            .and_then(|value| value.parse::<Decimal>().ok());
++        let initial_date = payload
++            .get("initial_balance_date")
++            .and_then(Value::as_str)
++            .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok());
++        if let (Some(initial), Some(initial_date)) = (initial, initial_date) {
++            let movements = realized_movements(items, source_id);
++            match balance_history(initial, initial_date, &movements, snapshot_date, current_balance)
++            {
++                Some(series) => {
++                    snapshots_saved +=
++                        backfill_cb_history(state, &account.id, &account.currency, source_id, &series)
++                            .await?;
++                }
++                None => tracing::warn!(
++                    "Patrimonio sync: CB history does not reproduce the published balance; only today is written"
++                ),
++            }
++        }
+         save_source_snapshot(
+             state,
+             &account.id,
+@@ -457,7 +605,7 @@ async fn sync_cb_accounts(
+             Vec::new(),
+             vec![CashBalanceInput {
+                 currency: currency.to_string(),
+-                amount: parse_decimal(balance, "saldo CB")?,
++                amount: current_balance,
+             }],
+         )
+         .await?;
+@@ -1170,6 +1318,88 @@ mod tests {
+         }
+     }
+ 
++    fn day(text: &str) -> NaiveDate {
++        NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
++    }
++
++    fn money(text: &str) -> Decimal {
++        text.parse().unwrap()
++    }
++
++    #[test]
++    fn balance_history_follows_realized_movements_and_ends_at_the_published_balance() {
++        let movements = vec![
++            (day("2026-01-05"), money("100.00")),
++            (day("2026-01-05"), money("-30.00")),
++            (day("2026-02-01"), money("-20.00")),
++            (day("2026-03-01"), money("999.00")),
++        ];
++        let series = balance_history(
++            money("10.00"),
++            day("2025-12-31"),
++            &movements,
++            day("2026-02-15"),
++            money("60.00"),
++        )
++        .unwrap();
++        assert_eq!(
++            series,
++            vec![
++                (day("2025-12-31"), money("10.00")),
++                (day("2026-01-05"), money("80.00")),
++                (day("2026-02-01"), money("60.00")),
++            ]
++        );
++    }
++
++    #[test]
++    fn balance_history_is_refused_when_it_does_not_reproduce_the_published_balance() {
++        let movements = vec![(day("2026-01-05"), money("100.00"))];
++        assert!(balance_history(
++            money("0.00"),
++            day("2025-12-31"),
++            &movements,
++            day("2026-01-31"),
++            money("99.00"),
++        )
++        .is_none());
++    }
++
++    #[test]
++    fn balance_history_counts_movements_on_the_opening_day_when_that_reproduces_the_balance() {
++        let movements = vec![(day("2025-12-31"), money("5.00"))];
++        let series = balance_history(
++            money("10.00"),
++            day("2025-12-31"),
++            &movements,
++            day("2026-01-31"),
++            money("15.00"),
++        )
++        .unwrap();
++        assert_eq!(series, vec![(day("2025-12-31"), money("15.00"))]);
++    }
++
++    #[test]
++    fn realized_movements_sign_by_entry_type_and_skip_open_entries() {
++        let items: Vec<Value> = serde_json::from_str(
++            r#"[
++              {"resource":"cash_entry","payload":{"account_id":"a","status":"realizado","realized_date":"2026-01-05","realized_amount":"100.00","entry_type":"receita"}},
++              {"resource":"cash_entry","payload":{"account_id":"a","status":"realizado","realized_date":"2026-01-06","realized_amount":"40.00","entry_type":"despesa"}},
++              {"resource":"cash_entry","payload":{"account_id":"a","status":"a_vencer","realized_date":null,"realized_amount":null,"entry_type":"despesa"}},
++              {"resource":"cash_entry","payload":{"account_id":"b","status":"realizado","realized_date":"2026-01-07","realized_amount":"1.00","entry_type":"receita"}},
++              {"resource":"account","payload":{"account_id":"a"}}
++            ]"#,
++        )
++        .unwrap();
++        assert_eq!(
++            realized_movements(&items, "a"),
++            vec![
++                (day("2026-01-05"), money("100.00")),
++                (day("2026-01-06"), money("-40.00")),
++            ]
++        );
++    }
++
+     #[test]
+     fn only_the_crv_snapshot_omits_the_price_history() {
+         let [cb, crv] = SOURCES;
+diff --git a/crates/core/src/addons/network.rs b/crates/core/src/addons/network.rs
+index b4b569e2..416775b3 100644
+--- a/crates/core/src/addons/network.rs
++++ b/crates/core/src/addons/network.rs
+@@ -17,6 +17,9 @@ use crate::secrets::{addon_secret_service_id, legacy_addon_secret_service_id, Se
+ 
+ const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+ const MAX_RESPONSE_BODY_BYTES: usize = 2 * 1024 * 1024;
++// Exact private targets are trusted local APIs (CB and CRV snapshots) whose size grows
++// with the user's data; the 2 MiB cap meant for public hosts must not break them.
++const MAX_PRIVATE_TARGET_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+ const REQUEST_TIMEOUT_SECS: u64 = 10;
+ const MAX_REQUEST_TIMEOUT_SECS: u64 = 120;
+ const PRIVATE_TARGETS_ENV: &str = "WF_ADDON_NETWORK_PRIVATE_TARGETS";
+@@ -130,13 +133,18 @@ pub async fn perform_addon_network_request(
+         }
+     }
+ 
+-    if response.content_length().unwrap_or_default() > MAX_RESPONSE_BODY_BYTES as u64 {
++    let max_response_body_bytes = if is_private_target {
++        MAX_PRIVATE_TARGET_RESPONSE_BODY_BYTES
++    } else {
++        MAX_RESPONSE_BODY_BYTES
++    };
++    if response.content_length().unwrap_or_default() > max_response_body_bytes as u64 {
+         return Err("Addon network response body is too large".to_string());
+     }
+     let mut response = response;
+     let mut body = Vec::new();
+     while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+-        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY_BYTES {
++        if body.len().saturating_add(chunk.len()) > max_response_body_bytes {
+             return Err("Addon network response body is too large".to_string());
+         }
+         body.extend_from_slice(&chunk);
