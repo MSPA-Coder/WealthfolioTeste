@@ -1,0 +1,377 @@
+diff --git a/apps/server/src/api/patrimonio_sync.rs b/apps/server/src/api/patrimonio_sync.rs
+index faa3be6a..9aaf56af 100644
+--- a/apps/server/src/api/patrimonio_sync.rs
++++ b/apps/server/src/api/patrimonio_sync.rs
+@@ -44,6 +44,7 @@ use wealthfolio_core::{
+     settings::SettingsServiceTrait,
+     utils::time_utils::{parse_user_timezone_or_default, user_today},
+ };
++use wealthfolio_core::activities::{Activity, NewActivity};
+ 
+ use crate::{
+     error::{ApiError, ApiResult},
+@@ -487,6 +488,248 @@ async fn backfill_cb_history(
+     Ok(series.len())
+ }
+ 
++const CB_SOURCE_SYSTEM: &str = "CONTROLE_BANCARIO";
++const B3_MIC: &str = "BVMF";
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum IncomeKind {
++    Dividend,
++    Lending,
++}
++
++impl IncomeKind {
++    fn activity_type(self) -> &'static str {
++        match self {
++            IncomeKind::Dividend => "DIVIDEND",
++            IncomeKind::Lending => "INTEREST",
++        }
++    }
++}
++
++/// A credit that the CB classifies as dividend, JCP or share-lending income.
++#[derive(Clone, Debug, PartialEq)]
++struct IncomeEntry {
++    key: String,
++    account_source_id: String,
++    date: NaiveDate,
++    amount: Decimal,
++    currency: String,
++    kind: IncomeKind,
++    symbol: Option<String>,
++    description: String,
++}
++
++fn fold_text(text: &str) -> String {
++    text.chars()
++        .map(|c| match c {
++            'á' | 'à' | 'â' | 'ã' | 'ä' | 'Á' | 'À' | 'Â' | 'Ã' => 'a',
++            'é' | 'è' | 'ê' | 'É' | 'Ê' => 'e',
++            'í' | 'î' | 'Í' => 'i',
++            'ó' | 'ô' | 'õ' | 'Ó' | 'Ô' | 'Õ' => 'o',
++            'ú' | 'û' | 'Ú' => 'u',
++            'ç' | 'Ç' => 'c',
++            other => other.to_ascii_lowercase(),
++        })
++        .collect()
++}
++
++fn is_income_category(name: &str) -> bool {
++    let folded = fold_text(name);
++    folded.contains("dividend") || folded.contains("jcp") || folded.contains("provento")
++}
++
++fn income_kind(description: &str) -> IncomeKind {
++    let folded = fold_text(description);
++    if folded.contains("remuneracao") || folded.contains("emprestimo") || folded.contains("aluguel")
++    {
++        IncomeKind::Lending
++    } else {
++        IncomeKind::Dividend
++    }
++}
++
++/// The ticker named in a bank description: either written out (`EALT4`) or
++/// derived from the ISIN-like code the broker prints (`Brraizacnpr6` is the
++/// preferred share of RAIZ, so RAIZ4). Funds and other classes return None.
++fn ticker_from_description(description: &str) -> Option<String> {
++    for token in description.split_whitespace() {
++        let chars: Vec<char> = token.chars().collect();
++        if (5..=6).contains(&chars.len())
++            && chars[..4].iter().all(|c| c.is_ascii_uppercase())
++            && chars[4..].iter().all(|c| c.is_ascii_digit())
++        {
++            return Some(token.to_string());
++        }
++    }
++    for token in description.split_whitespace() {
++        if token.len() == 12 && token.is_ascii() && token[..2].eq_ignore_ascii_case("br") {
++            let issuer = &token[2..6];
++            let class = token[6..11].to_ascii_lowercase();
++            if !issuer.chars().all(|c| c.is_ascii_alphabetic()) {
++                continue;
++            }
++            let suffix = match class.as_str() {
++                "acnor" => '3',
++                "acnpr" => '4',
++                _ => continue,
++            };
++            return Some(format!("{}{suffix}", issuer.to_ascii_uppercase()));
++        }
++    }
++    None
++}
++
++fn parse_income_entries(items: &[Value]) -> Vec<IncomeEntry> {
++    let categories: std::collections::HashMap<&str, &str> = items
++        .iter()
++        .filter(|item| item.get("resource").and_then(Value::as_str) == Some("category"))
++        .filter_map(|item| item.get("payload"))
++        .filter_map(|payload| {
++            Some((
++                payload.get("source_id")?.as_str()?,
++                payload.get("name")?.as_str()?,
++            ))
++        })
++        .collect();
++    items
++        .iter()
++        .filter(|item| item.get("resource").and_then(Value::as_str) == Some("cash_entry"))
++        .filter_map(|item| {
++            let key = item.get("source_id").and_then(Value::as_str)?;
++            let payload = item.get("payload")?;
++            if payload.get("status").and_then(Value::as_str) != Some("realizado")
++                || payload.get("entry_type").and_then(Value::as_str) != Some("receita")
++            {
++                return None;
++            }
++            let category = categories.get(payload.get("category_id")?.as_str()?)?;
++            if !is_income_category(category) {
++                return None;
++            }
++            let date = NaiveDate::parse_from_str(
++                payload.get("realized_date")?.as_str()?,
++                "%Y-%m-%d",
++            )
++            .ok()?;
++            let amount = payload.get("realized_amount")?.as_str()?.parse::<Decimal>().ok()?;
++            let description = payload
++                .get("description")
++                .and_then(Value::as_str)
++                .unwrap_or_default();
++            Some(IncomeEntry {
++                key: key.to_string(),
++                account_source_id: payload.get("account_id")?.as_str()?.to_string(),
++                date,
++                amount,
++                currency: payload
++                    .get("currency")
++                    .and_then(Value::as_str)
++                    .unwrap_or("BRL")
++                    .to_string(),
++                kind: income_kind(description),
++                symbol: ticker_from_description(description),
++                description: description.to_string(),
++            })
++        })
++        .collect()
++}
++
++fn income_activity_json(entry: &IncomeEntry, account_id: &str) -> Value {
++    let mut activity = serde_json::json!({
++        "accountId": account_id,
++        "activityType": entry.kind.activity_type(),
++        "activityDate": format!("{}T12:00:00.000Z", entry.date),
++        "currency": entry.currency,
++        "amount": entry.amount.to_string(),
++        "status": "POSTED",
++        "notes": format!("CB: {}", entry.description),
++        "sourceSystem": CB_SOURCE_SYSTEM,
++        "sourceRecordId": entry.key,
++        "idempotencyKey": entry.key,
++    });
++    if let Some(symbol) = &entry.symbol {
++        activity["asset"] = serde_json::json!({ "symbol": symbol, "exchangeMic": B3_MIC });
++    }
++    activity
++}
++
++fn income_activity_matches(activity: &Activity, entry: &IncomeEntry, account_id: &str) -> bool {
++    activity.account_id == account_id
++        && activity.activity_type == entry.kind.activity_type()
++        && activity.amount == Some(entry.amount)
++        && activity.currency == entry.currency
++        && activity.activity_date.date_naive() == entry.date
++}
++
++/// Mirrors the CB's dividend, JCP and share-lending credits as income
++/// activities on the account that received them. The CB stays the owner of the
++/// cash: these activities carry no balance (the accounts are in holdings mode).
++/// Only activities this importer created (source system and idempotency key)
++/// are ever changed. Returns (created, removed).
++async fn sync_cb_income(
++    state: &AppState,
++    entries: &[IncomeEntry],
++    accounts: &std::collections::HashMap<String, String>,
++) -> Result<(usize, usize), String> {
++    let account_ids: Vec<String> = accounts.values().cloned().collect();
++    let existing: Vec<Activity> = state
++        .activity_service
++        .get_activities_by_account_ids(&account_ids)
++        .map_err(|_| "Não foi possível ler as atividades existentes.".to_string())?
++        .into_iter()
++        .filter(|activity| activity.source_system.as_deref() == Some(CB_SOURCE_SYSTEM))
++        .collect();
++
++    let mut desired: std::collections::HashMap<&str, (&IncomeEntry, &str)> =
++        std::collections::HashMap::new();
++    for entry in entries {
++        let Some(account_id) = accounts.get(&entry.account_source_id) else {
++            continue;
++        };
++        // A dividend needs the asset it came from; without a ticker it is skipped.
++        if entry.kind == IncomeKind::Dividend && entry.symbol.is_none() {
++            continue;
++        }
++        desired.insert(entry.key.as_str(), (entry, account_id.as_str()));
++    }
++
++    let mut kept: BTreeSet<String> = BTreeSet::new();
++    let mut removed = 0;
++    for activity in &existing {
++        let key = activity.idempotency_key.as_deref();
++        let unchanged = key
++            .and_then(|key| desired.get(key))
++            .is_some_and(|(entry, account_id)| income_activity_matches(activity, entry, account_id));
++        if unchanged {
++            if let Some(key) = key {
++                kept.insert(key.to_string());
++            }
++            continue;
++        }
++        state
++            .activity_service
++            .delete_activity(activity.id.clone())
++            .await
++            .map_err(|_| "Não foi possível remover uma atividade desatualizada.".to_string())?;
++        removed += 1;
++    }
++
++    let mut created = 0;
++    for (key, (entry, account_id)) in &desired {
++        if kept.contains(*key) {
++            continue;
++        }
++        let new_activity: NewActivity =
++            serde_json::from_value(income_activity_json(entry, account_id))
++                .map_err(|_| "Atividade de renda do CB inválida.".to_string())?;
++        match state.activity_service.create_activity(new_activity).await {
++            Ok(_) => created += 1,
++            Err(_) => tracing::warn!("Patrimonio sync: could not create one CB income activity"),
++        }
++    }
++    Ok((created, removed))
++}
++
+ async fn sync_cb_accounts(
+     state: &AppState,
+     snapshot: &Value,
+@@ -525,6 +768,8 @@ async fn sync_cb_accounts(
+         .and_then(Value::as_str)
+         .map(str::to_string);
+     let mut imported_sources = BTreeSet::new();
++    let mut income_accounts: std::collections::HashMap<String, String> =
++        std::collections::HashMap::new();
+     let mut accounts_synced = 0;
+     let mut snapshots_saved = 0;
+     for item in items {
+@@ -574,6 +819,7 @@ async fn sync_cb_accounts(
+         )
+         .await?;
+         accounts_synced += 1;
++        income_accounts.insert(source_id.to_string(), account.id.clone());
+         let current_balance = parse_decimal(balance, "saldo CB")?;
+         let initial = payload
+             .get("initial_balance")
+@@ -612,6 +858,19 @@ async fn sync_cb_accounts(
+         snapshots_saved += 1;
+     }
+ 
++    // Income is a convenience on top of the balances: a failure here is logged
++    // and retried on the next import, and never undoes the balances above.
++    match sync_cb_income(state, &parse_income_entries(items), &income_accounts).await {
++        Ok((created, removed)) => {
++            if created > 0 || removed > 0 {
++                tracing::info!(
++                    "Patrimonio sync: CB income activities created={created} removed={removed}"
++                );
++            }
++        }
++        Err(error) => tracing::warn!("Patrimonio sync: CB income not applied: {error}"),
++    }
++
+     // Absence is only safe to reconcile because the source declared the account
+     // collection complete (checked above): an account that left the source gets
+     // a zero balance instead of keeping a stale one.
+@@ -1318,6 +1577,78 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn income_categories_are_recognised_by_name_without_accents() {
++        assert!(is_income_category("Aluguel de Açoes / Dividendos / JCP"));
++        assert!(is_income_category("Proventos"));
++        assert!(!is_income_category("Rendimentos"));
++        assert!(!is_income_category("Operações em Bolsa"));
++    }
++
++    #[test]
++    fn tickers_come_from_the_text_or_from_the_isin_like_code() {
++        assert_eq!(
++            ticker_from_description("JUROS S/ CAPITAL DE CLIENTES EALT4 S/ 6,300").as_deref(),
++            Some("EALT4")
++        );
++        assert_eq!(
++            ticker_from_description("Taxa de Remuneração Emprestimo Ações Brraizacnpr6").as_deref(),
++            Some("RAIZ4")
++        );
++        assert_eq!(
++            ticker_from_description("Cred Reembolso Jcp-Btc Brbbasacnor3 0,00").as_deref(),
++            Some("BBAS3")
++        );
++        assert_eq!(
++            ticker_from_description("Dividendos Brwegeacnor0").as_deref(),
++            Some("WEGE3")
++        );
++        assert_eq!(
++            ticker_from_description("Taxa de Remuneração Emprestimo Ações Brhodlctf005"),
++            None
++        );
++        assert_eq!(ticker_from_description("INSS benefício 01632823010"), None);
++    }
++
++    #[test]
++    fn share_lending_is_told_apart_from_dividends() {
++        assert_eq!(
++            income_kind("Taxa de Remuneração Emprestimo Ações Brsmtoacnor3"),
++            IncomeKind::Lending
++        );
++        assert_eq!(income_kind("DIVIDENDOS DE CLIENTES EALT4 S/ 6,300"), IncomeKind::Dividend);
++        assert_eq!(income_kind("Cred Reembolso Jcp-Btc Brbbasacnor3"), IncomeKind::Dividend);
++    }
++
++    #[test]
++    fn income_entries_keep_only_realized_credits_of_income_categories() {
++        let items: Vec<Value> = serde_json::from_str(
++            r#"[
++              {"resource":"category","source_id":"c1","payload":{"source_id":"c1","name":"Aluguel de Açoes / Dividendos / JCP"}},
++              {"resource":"category","source_id":"c2","payload":{"source_id":"c2","name":"Salário"}},
++              {"resource":"cash_entry","source_id":"e1","payload":{"account_id":"a","category_id":"c1","status":"realizado","entry_type":"receita","realized_date":"2026-09-11","realized_amount":"149.73","currency":"BRL","description":"Cred Reembolso Jcp-Btc Brbbasacnor3 0,00"}},
++              {"resource":"cash_entry","source_id":"e2","payload":{"account_id":"a","category_id":"c2","status":"realizado","entry_type":"receita","realized_date":"2026-09-05","realized_amount":"1000.00","currency":"BRL","description":"Salário"}},
++              {"resource":"cash_entry","source_id":"e3","payload":{"account_id":"a","category_id":"c1","status":"a_vencer","entry_type":"receita","realized_date":null,"realized_amount":null,"currency":"BRL","description":"Dividendos"}},
++              {"resource":"cash_entry","source_id":"e4","payload":{"account_id":"a","category_id":"c1","status":"realizado","entry_type":"despesa","realized_date":"2026-06-30","realized_amount":"0.06","currency":"BRL","description":"Tx de Liquidação"}}
++            ]"#,
++        )
++        .unwrap();
++        let entries = parse_income_entries(&items);
++        assert_eq!(entries.len(), 1);
++        assert_eq!(entries[0].key, "e1");
++        assert_eq!(entries[0].account_source_id, "a");
++        assert_eq!(entries[0].date, day("2026-09-11"));
++        assert_eq!(entries[0].amount, money("149.73"));
++        assert_eq!(entries[0].kind, IncomeKind::Dividend);
++        assert_eq!(entries[0].symbol.as_deref(), Some("BBAS3"));
++        let json = income_activity_json(&entries[0], "wf-1");
++        assert_eq!(json["activityType"], "DIVIDEND");
++        assert_eq!(json["idempotencyKey"], "e1");
++        assert_eq!(json["asset"]["symbol"], "BBAS3");
++        assert_eq!(json["asset"]["exchangeMic"], "BVMF");
++        assert_eq!(json["activityDate"], "2026-09-11T12:00:00.000Z");
++    }
++
+     fn day(text: &str) -> NaiveDate {
+         NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
+     }
