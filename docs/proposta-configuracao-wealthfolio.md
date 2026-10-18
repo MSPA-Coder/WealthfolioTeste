@@ -1,101 +1,101 @@
-# Proposta de configuração do Wealthfolio (18/10/2026)
+# Configuração do Wealthfolio para a casa (18/10/2026)
 
-Base: dados de produção do CB e do CRV (leitura), jan a set/2026, e o estado da
-instância depois dos patches 0013 a 0015. Nada aqui foi aplicado, exceto o item 1
-(patch 0016). Os números são fatos do seu histórico; as decisões de quanto ter
-em cada classe ou de quanto poupar são suas (não é recomendação de investimento).
+Mariano, Cláudia e Esther são uma pessoa só para orçamento, metas e alocação:
+despesas e receitas dos três são usadas em conjunto e não há meta individual. Os
+portfolios `Mariano`, `Claudia` e `Esther` ficam só como filtro de consulta; o
+orçamento, a meta e o alvo valem para a casa inteira.
 
-## 1. Aplicações como renda fixa (feito no patch 0016)
+Base: dados de produção do CB e do CRV (leitura), jan a set/2026, e a instância
+depois dos patches 0013 a 0016. Itens 1 a 5 e 7 já estão aplicados na instância
+do VPS1. As decisões de quanto ter em cada classe ou de quanto poupar são suas
+(não é recomendação de investimento).
+
+## 1. Aplicações como renda fixa (patch 0016, aplicado)
 
 As 7 aplicações do CB (CDB, Caixinha, Cofrinho, Rende Fácil e Tesouro Direto,
-R$ 170,9 mil) hoje entram na alocação como `Cash`. O Wealthfolio guarda a classe
-do caixa de uma conta em `meta.allocation.cashCategoryId`. Testado na instância
-com uma conta temporária (já excluída): com `FIXED_INCOME`, a conta aparece 100%
-como Fixed Income.
-
-O 0016 faz o importador gravar essa classe nas contas do grupo `Aplicações`:
+R$ 170,9 mil, dos três titulares) entravam na alocação como `Cash`. O
+Wealthfolio guarda a classe do caixa de uma conta em
+`meta.allocation.cashCategoryId`, e o importador passa a gravar `FIXED_INCOME`
+nas contas do grupo `Aplicações`:
 
 - `meta` passa de texto puro (`controlePatrimonial:...`) para JSON com a mesma
-  chave e a classe: `{"controlePatrimonial":"...","allocation":{"cashCategoryId":"FIXED_INCOME"}}`.
-  A adoção por marcador lê os dois formatos.
+  chave e a classe. A adoção por marcador lê os dois formatos.
 - Uma classe escolhida na tela não é sobrescrita, e as outras chaves do JSON
   ficam como estão.
-- Efeito esperado: `Cash` cai de 44% para uns 12% (conta corrente e caixa de
-  corretora), e `Fixed Income` sobe de 0,1% para uns 32%. O patrimônio não muda.
+- Resultado medido depois do deploy: Equity 55,8%, Fixed Income 32,2% e Cash
+  12,0%, sobre R$ 532.089 de ativos (antes: Cash 44%, Fixed Income 0,1%).
 
-## 2. Orçamento (budget)
+## 2. Escopo do Spending e orçamento (aplicado)
 
-O CB de produção não tem orçamento. A proposta sai do gasto real do Mariano
-(contas correntes e cartões, só despesa gerencial, jan a set/2026), um alvo por
-categoria no mesmo grupo que o CB já usa. Alvo = média mensal arredondada para
-cima de R$ 10. Total R$ 7.760 por mês (média real: R$ 7.663).
+O escopo do Spending tem as contas correntes e os cartões dos três: 6 do
+Mariano, 3 da Cláudia e 1 da Esther. As aplicações ficam fora, porque os
+lançamentos delas são movimentação (por exemplo, a conta `Tesouro Direto`, com
+R$ 8,8 mil de saídas que não são gasto). `Despesas reembolsáveis` fica fora do
+orçamento por decisão do usuário.
+
+Gasto médio da casa jan a set/2026: **R$ 15.344 por mês** (Mariano cerca de
+R$ 7,6 mil, Cláudia cerca de R$ 7,9 mil, Esther quase zero). Orçamento
+aplicado: **R$ 15.450 por mês**, o alvo de cada categoria é a média arredondada
+para cima de R$ 10. Os grupos têm os mesmos nomes dos grupos do CB.
 
 | Grupo | Categoria | Média | Mediana | Máximo | Meses com gasto | Alvo |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Alimentação | Supermercado | 830 | 734 | 1.464 | 9 | 830 |
-| Alimentação | Alimentação | 683 | 468 | 1.635 | 9 | 690 |
+| Alimentação | Mercado (VA) | 1.628 | 1.600 | 1.664 | 9 | 1.630 |
+| Alimentação | Supermercado | 835 | 734 | 1.508 | 9 | 840 |
+| Alimentação | Alimentação | 689 | 468 | 1.635 | 9 | 690 |
 | Bancos e cartões | Cartão de Crédito | 98 | 98 | 98 | 9 | 100 |
-| Compras | Compras online | 161 | 80 | 519 | 8 | 170 |
-| DBR | Despesas reembolsáveis | 209 | 170 | 532 | 6 | 210 |
-| Impostos | Impostos e Tributos | 390 | 0 | 1.984 | 3 | 390 (rollover) |
-| Imóvel Butantã | Imóvel Butantã | 31 | 0 | 280 | 1 | 40 (rollover) |
-| Lazer | Lazer | 332 | 279 | 974 | 9 | 340 |
-| Lazer | Loterias | 105 | 84 | 236 | 8 | 110 |
-| Moradia | Casa | 1.046 | 1.177 | 1.290 | 9 | 1.050 |
-| Outros | Outros | 191 | 194 | 321 | 9 | 200 |
-| Pessoal | Pessoais - Roupas, beleza, etc | 807 | 771 | 1.151 | 9 | 810 |
-| Pessoal | Educação | 13 | 0 | 119 | 1 | 20 (rollover) |
+| Compras | Compras online | 161 | 99 | 519 | 8 | 170 |
+| Impostos | Impostos e Tributos | 911 | 1.180 | 1.984 | 7 | 920 (rollover) |
+| Imóvel Butantã | Imóvel Butantã | 55 | 247 | 280 | 2 | 60 (rollover) |
+| Imóvel Jardim Iva | Jardim Iva | 1.698 | 681 | 8.781 | 9 | 1.700 (rollover) |
+| Lazer | Lazer | 395 | 279 | 1.149 | 9 | 400 |
+| Lazer | Loterias | 105 | 102 | 236 | 8 | 110 |
+| Moradia | Casa | 2.272 | 2.396 | 2.690 | 9 | 2.280 |
+| Outros | Outros | 211 | 217 | 321 | 9 | 220 |
+| Pessoal | Pessoais - Roupas, beleza, etc | 821 | 800 | 1.201 | 9 | 830 |
+| Pessoal | Educação | 87 | 330 | 330 | 3 | 90 (rollover) |
+| Saúde | Plano de saúde | 1.761 | 1.672 | 2.518 | 9 | 1.770 |
+| Saúde | Saúde | 751 | 533 | 5.467 | 5 | 760 (rollover) |
 | Saúde | Farmácia | 683 | 593 | 1.071 | 9 | 690 |
-| Saúde | Saúde | 288 | 40 | 1.297 | 5 | 290 |
-| Saúde | Plano de saúde | 99 | 0 | 891 | 1 | 100 (rollover) |
+| Saúde | Bem-estar | 260 | 390 | 390 | 6 | 260 (rollover) |
 | Trabalho e tecnologia | Custos Diversos Associados ao Trabalho | 294 | 236 | 692 | 9 | 300 |
-| Transporte | Veículos | 561 | 559 | 762 | 9 | 570 |
-| Viagem | Viagem | 842 | 0 | 4.865 | 2 | 850 (rollover) |
+| Transporte | Veículos | 572 | 570 | 762 | 9 | 580 |
+| Viagem | Viagem | 1.047 | 2.022 | 4.865 | 4 | 1.050 (rollover) |
 
-Por grupo: Alimentação 1.520, Bancos e cartões 100, Compras 170, DBR 210,
-Impostos 390, Imóvel Butantã 40, Lazer 450, Moradia 1.050, Outros 200, Pessoal
-830, Saúde 1.080, Trabalho e tecnologia 300, Transporte 570, Viagem 850.
+A mediana é a dos meses com gasto. Categorias de gasto irregular (poucos meses
+com gasto ou máximo muito acima da média) têm `rollover`: o que sobra de um mês
+acumula para o seguinte, a partir de out/2026. A categoria `DBR` (R$ 73 em um
+único mês) ficou sem alvo.
 
-Categorias de gasto irregular (mediana 0 ou poucos meses com gasto) ficam com
-`rollover`: o que sobra de um mês acumula para o seguinte. `Despesas
-reembolsáveis` (DBR) volta como reembolso; vale decidir se entra no orçamento.
+## 3. Regras de categorização (nenhuma)
 
-## 3. Regras de categorização
+O CB já categoriza todos os lançamentos, e o Wealthfolio recebe a categoria
+junto (nenhuma despesa sem categoria em jan a out/2026). Uma regra por texto da
+descrição só atrapalharia a categoria que veio do CB. Criar regra só se um dia o
+Wealthfolio receber lançamentos que não passem pelo CB (por exemplo, CSV
+importado direto). As transferências entre os três já estão marcadas como
+transferência no CB, então não contam como gasto nem como renda.
 
-Não propor nenhuma. O CB já categoriza todos os lançamentos, e o Wealthfolio
-recebe a categoria junto (nenhuma despesa sem categoria em jan a out/2026). Uma
-regra por texto da descrição só atrapalharia a categoria que veio do CB. Criar
-regra só se um dia o Wealthfolio receber lançamentos que não passem pelo CB
-(por exemplo, CSV importado direto).
+## 4. Meta (aplicada)
 
-## 4. Metas (Goals)
+**Reserva de liquidez**: R$ 92.100, 6 meses do gasto médio da casa
+(R$ 15.344 × 6), do tipo fundo de emergência. É financiada pelas 7 aplicações
+(100% de cada), hoje R$ 170,9 mil: a meta já nasce atingida, com cobertura de
+cerca de 11 meses. Para 12 meses, o valor seria R$ 184 mil (basta editar o valor
+da meta). Outras metas (compra, viagem, aposentadoria) dependem de objetivo e
+prazo que o CB e o CRV não têm.
 
-Uma meta tem valor-alvo, data e contas que a financiam (com percentual por
-conta). Proposta de uma meta, com a conta dos fatos:
+## 5. Alocação alvo (aplicada)
 
-- **Reserva de liquidez**, financiada pelas aplicações do Mariano
-  (R$ 151,2 mil hoje: C6 CDB, Cofrinho, Rende Fácil e Tesouro Direto).
-- Gasto médio mensal real: R$ 7.663. Valor-alvo por número de meses:
-  3 meses R$ 22.988, 6 meses R$ 45.977, 12 meses R$ 91.953.
-- Hoje as aplicações do Mariano cobrem 19,7 meses do gasto médio, então qualquer
-  uma das três já nasce atingida. O número de meses que vale como meta é seu.
+Alvo da casa (escopo "todas as contas", classes de ativo), igual ao peso do dia
+18/10/2026, só para a tela mostrar desvios sem eu decidir quanto ter em cada
+classe. Faixa de tolerância de 5 pontos percentuais e gatilho manual.
 
-Outras metas (compra, viagem, aposentadoria) dependem de objetivo e prazo que o
-CB e o CRV não têm.
-
-## 5. Alocação alvo
-
-Depois do 0016, as classes atuais são aproximadamente:
-
-| Classe | Valor | Peso |
-| --- | ---: | ---: |
-| Equity (ações e ETFs) | R$ 297,0 mil | 55,8% |
-| Fixed Income (aplicações) | R$ 171,3 mil | 32,2% |
-| Cash (contas correntes e caixa das corretoras) | R$ 63,8 mil | 12,0% |
-
-Proposta neutra: gravar o alvo igual ao peso atual (56 / 32 / 12). A tela passa
-a mostrar o desvio a cada mudança, sem eu decidir quanto você deve ter em cada
-classe. Os percentuais que você quiser trocar são edição de um campo.
+| Classe | Valor | Peso atual | Alvo |
+| --- | ---: | ---: | ---: |
+| Equity (ações e ETFs) | R$ 297,0 mil | 55,8% | 56% |
+| Fixed Income (aplicações) | R$ 171,3 mil | 32,2% | 32% |
+| Cash (contas correntes e caixa das corretoras) | R$ 63,8 mil | 12,0% | 12% |
 
 ## 6. Benchmark
 
