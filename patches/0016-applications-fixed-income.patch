@@ -1,0 +1,227 @@
+diff --git a/apps/server/src/api/patrimonio_sync.rs b/apps/server/src/api/patrimonio_sync.rs
+index 5e5d372a0..cb46d5893 100644
+--- a/apps/server/src/api/patrimonio_sync.rs
++++ b/apps/server/src/api/patrimonio_sync.rs
+@@ -439,6 +439,56 @@ fn marker(source_id: &str) -> String {
+     format!("{MARKER_PREFIX}:{source_id}")
+ }
+ 
++/// The importer marker of an account, whether `meta` holds it as plain text (how
++/// the accounts were first created) or inside a JSON object, which is what the
++/// account screen writes as soon as an allocation class is chosen.
++fn account_marker(meta: Option<&str>) -> Option<String> {
++    let meta = meta?.trim();
++    if meta.starts_with(MARKER_PREFIX) {
++        return Some(meta.to_string());
++    }
++    let parsed: Value = serde_json::from_str(meta).ok()?;
++    parsed.get(MARKER_PREFIX)?.as_str().map(str::to_string)
++}
++
++/// The allocation class chosen for the account's cash, if any.
++fn cash_category(meta: Option<&str>) -> Option<String> {
++    let parsed: Value = serde_json::from_str(meta?.trim()).ok()?;
++    parsed
++        .get("allocation")?
++        .get("cashCategoryId")?
++        .as_str()
++        .filter(|category| !category.is_empty())
++        .map(str::to_string)
++}
++
++/// `meta` for an imported account: the plain marker, or a JSON object with the
++/// marker and the allocation class when the account has one. The other keys of
++/// a JSON `meta` stay as they are, and a class already chosen is not replaced.
++fn account_meta(existing: Option<&str>, spec: &AccountSpec<'_>) -> String {
++    let mut object = existing
++        .and_then(|meta| serde_json::from_str::<Value>(meta.trim()).ok())
++        .and_then(|value| match value {
++            Value::Object(map) => Some(map),
++            _ => None,
++        })
++        .unwrap_or_default();
++    if spec.cash_category.is_none() && object.is_empty() {
++        return spec.marker.clone();
++    }
++    object.insert(MARKER_PREFIX.to_string(), Value::String(spec.marker.clone()));
++    if let Some(category) = spec.cash_category {
++        let allocation = object
++            .entry("allocation".to_string())
++            .or_insert_with(|| serde_json::json!({}));
++        if let Some(map) = allocation.as_object_mut() {
++            map.entry("cashCategoryId".to_string())
++                .or_insert_with(|| Value::String(category.to_string()));
++        }
++    }
++    Value::Object(object).to_string()
++}
++
+ struct AccountSpec<'a> {
+     marker: String,
+     provider: &'a str,
+@@ -449,6 +499,9 @@ struct AccountSpec<'a> {
+     /// Wealthfolio `group`, applied when the account has none (never over the operator's choice).
+     group: Option<&'static str>,
+     tracking_mode: TrackingMode,
++    /// Allocation class of the account's cash (`FIXED_INCOME` for applications),
++    /// written into `meta` when the account has none.
++    cash_category: Option<&'static str>,
+ }
+ 
+ struct SyncedAccount {
+@@ -792,10 +845,8 @@ fn accounts_with_marker_prefix(state: &AppState, prefix: &str) -> Result<Vec<Acc
+         .into_iter()
+         .filter(|account| {
+             !account.is_archived
+-                && account
+-                    .meta
+-                    .as_deref()
+-                    .is_some_and(|meta| meta.starts_with(prefix))
++                && account_marker(account.meta.as_deref())
++                    .is_some_and(|found| found.starts_with(prefix))
+         })
+         .collect())
+ }
+@@ -806,7 +857,9 @@ fn accounts_with_marker_prefix(state: &AppState, prefix: &str) -> Result<Vec<Acc
+ fn select_existing<'a>(accounts: &'a [Account], spec: &AccountSpec<'_>) -> Option<&'a Account> {
+     let live = || accounts.iter().filter(|account| !account.is_archived);
+     live()
+-        .find(|account| account.meta.as_deref() == Some(spec.marker.as_str()))
++        .find(|account| {
++            account_marker(account.meta.as_deref()).as_deref() == Some(spec.marker.as_str())
++        })
+         .or_else(|| {
+             live().find(|account| {
+                 account.provider.as_deref() == Some(spec.provider)
+@@ -827,7 +880,8 @@ async fn ensure_source_account(
+     if let Some(existing) = select_existing(&accounts, spec) {
+         let unchanged = existing.name == spec.name
+             && existing.account_type == spec.account_type
+-            && existing.meta.as_deref() == Some(spec.marker.as_str())
++            && account_marker(existing.meta.as_deref()).as_deref() == Some(spec.marker.as_str())
++            && (spec.cash_category.is_none() || cash_category(existing.meta.as_deref()).is_some())
+             && existing.provider.as_deref() == Some(spec.provider)
+             && existing.provider_account_id.as_deref() == Some(spec.provider_account_id)
+             && existing.is_active
+@@ -856,7 +910,7 @@ async fn ensure_source_account(
+                 tracking_mode: Some(spec.tracking_mode),
+                 platform_id: existing.platform_id.clone(),
+                 account_number: existing.account_number.clone(),
+-                meta: Some(spec.marker.clone()),
++                meta: Some(account_meta(existing.meta.as_deref(), spec)),
+                 provider: Some(spec.provider.to_string()),
+                 provider_account_id: Some(spec.provider_account_id.to_string()),
+             })
+@@ -882,7 +936,7 @@ async fn ensure_source_account(
+             is_active: true,
+             platform_id: None,
+             account_number: None,
+-            meta: Some(spec.marker.clone()),
++            meta: Some(account_meta(None, spec)),
+             provider: Some(spec.provider.to_string()),
+             provider_account_id: Some(spec.provider_account_id.to_string()),
+             is_archived: false,
+@@ -1309,6 +1363,7 @@ mod tests {
+             account_type: account_types::CASH,
+             group: None,
+             tracking_mode: TrackingMode::Holdings,
++            cash_category: None,
+         }
+     }
+ 
+@@ -1659,4 +1714,53 @@ mod tests {
+         let status: SourceStatus = serde_json::from_str(old).unwrap();
+         assert_eq!(status.applied_on, None);
+     }
++
++    #[test]
++    fn the_marker_is_read_from_plain_text_and_from_json() {
++        let plain = marker("controle-bancario:account:1");
++        assert_eq!(account_marker(Some(&plain)), Some(plain.clone()));
++        let json = format!(r#"{{"controlePatrimonial":"{plain}","allocation":{{"cashCategoryId":"FIXED_INCOME"}}}}"#);
++        assert_eq!(account_marker(Some(&json)), Some(plain));
++        assert_eq!(account_marker(Some(r#"{"allocation":{}}"#)), None);
++        assert_eq!(account_marker(Some("outra coisa")), None);
++        assert_eq!(account_marker(None), None);
++    }
++
++    #[test]
++    fn an_application_gets_its_allocation_class_and_keeps_its_marker() {
++        let mut savings = spec("controle-bancario:account:1");
++        savings.cash_category = Some("FIXED_INCOME");
++        let meta = account_meta(Some(&savings.marker), &savings);
++        assert_eq!(account_marker(Some(&meta)), Some(savings.marker.clone()));
++        assert_eq!(cash_category(Some(&meta)).as_deref(), Some("FIXED_INCOME"));
++        // Running again changes nothing.
++        assert_eq!(account_meta(Some(&meta), &savings), meta);
++    }
++
++    #[test]
++    fn a_class_chosen_on_the_screen_and_other_keys_survive() {
++        let mut savings = spec("controle-bancario:account:1");
++        savings.cash_category = Some("FIXED_INCOME");
++        let chosen = r#"{"allocation":{"cashCategoryId":"EQUITY"},"accounting":{"costBasisMethod":"fifo"}}"#;
++        let meta = account_meta(Some(chosen), &savings);
++        assert_eq!(cash_category(Some(&meta)).as_deref(), Some("EQUITY"));
++        assert_eq!(account_marker(Some(&meta)), Some(savings.marker.clone()));
++        let parsed: Value = serde_json::from_str(&meta).unwrap();
++        assert_eq!(parsed["accounting"]["costBasisMethod"], "fifo");
++    }
++
++    #[test]
++    fn an_account_without_a_class_keeps_the_plain_marker() {
++        let plain = spec("controle-bancario:account:1");
++        assert_eq!(account_meta(None, &plain), plain.marker);
++        assert_eq!(account_meta(Some(&plain.marker), &plain), plain.marker);
++    }
++
++    #[test]
++    fn an_account_with_json_meta_is_still_found_by_its_marker() {
++        let wanted = spec("controle-bancario:account:1");
++        let json = format!(r#"{{"controlePatrimonial":"{}"}}"#, wanted.marker);
++        let accounts = vec![account("a1", Some(&json), None, false)];
++        assert!(select_existing(&accounts, &wanted).is_some());
++    }
+ }
+diff --git a/apps/server/src/api/patrimonio_sync/ledger.rs b/apps/server/src/api/patrimonio_sync/ledger.rs
+index ec9ef991b..01902ee66 100644
+--- a/apps/server/src/api/patrimonio_sync/ledger.rs
++++ b/apps/server/src/api/patrimonio_sync/ledger.rs
+@@ -987,6 +987,7 @@ pub(super) async fn sync_brokerages(
+                 account_type: account_types::SECURITIES,
+                 group: Some(GROUP_BROKERAGE),
+                 tracking_mode: TrackingMode::Holdings,
++                cash_category: None,
+             },
+         )
+         .await?;
+@@ -1060,7 +1061,7 @@ pub(super) async fn sync_brokerages(
+     for cb_source_id in outcome.account_map.keys() {
+         let wanted = marker(cb_source_id);
+         for old in accounts_with_marker_prefix(state, &marker(CB_ACCOUNT_PREFIX))? {
+-            if old.meta.as_deref() == Some(wanted.as_str()) {
++            if account_marker(old.meta.as_deref()).as_deref() == Some(wanted.as_str()) {
+                 archive_account(state, &old).await?;
+             }
+         }
+@@ -1069,10 +1070,7 @@ pub(super) async fn sync_brokerages(
+     // A brokerage that no longer has anything gets an empty snapshot, which the
+     // complete declaration of both sources allows.
+     for stale in accounts_with_marker_prefix(state, &marker(CRV_ACCOUNT_PREFIX))? {
+-        if stale
+-            .meta
+-            .as_deref()
+-            .is_some_and(|meta| active.contains(meta))
++        if account_marker(stale.meta.as_deref()).is_some_and(|found| active.contains(&found))
+         {
+             continue;
+         }
+@@ -1149,6 +1147,8 @@ pub(super) async fn sync_cb_ledger(
+                 account_type: account.kind.account_type(),
+                 group: Some(account.kind.group()),
+                 tracking_mode: TrackingMode::Transactions,
++                // Applications (CDB, Caixinha, Tesouro) are fixed income, not cash.
++                cash_category: (account.kind == CbKind::Savings).then_some("FIXED_INCOME"),
+             },
+         )
+         .await?;
