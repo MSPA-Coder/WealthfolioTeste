@@ -17,7 +17,9 @@ somente leitura e rede interna do VPS.
 - `WEALTHFOLIO_COMMIT` e patches devem gerar imagem reproduzível; não use um
   checkout upstream modificado como substituto de patch versionado.
 - CB e CRV são as fontes operacionais. A sincronização é somente de leitura,
-  idempotente e não cria fatos operacionais no Wealthfolio.
+  idempotente e só cria no Wealthfolio atividades que ela mesma gerencia
+  (`source_system = CONTROLE_BANCARIO`, chave de idempotência do lançamento),
+  espelhando o ledger do CB; nada é escrito de volta no CB nem no CRV.
 - Não abra APIs privadas, enfraqueça criptografia nem apague volume, chave ou
   backup para resolver uma falha.
 

@@ -1,0 +1,2299 @@
+diff --git a/apps/server/src/api/patrimonio_sync.rs b/apps/server/src/api/patrimonio_sync.rs
+index 9aaf56af2..b3c8c3899 100644
+--- a/apps/server/src/api/patrimonio_sync.rs
++++ b/apps/server/src/api/patrimonio_sync.rs
+@@ -51,6 +51,8 @@ use crate::{
+     main_lib::AppState,
+ };
+ 
++mod ledger;
++
+ const ADDON_ID: &str = "controle-patrimonial-sync";
+ const CONTRACT: &str = "patrimonio/v4";
+ const CB_BASE_URL: &str = "http://cb-api:8000/patrimonio/v4";
+@@ -158,6 +160,8 @@ async fn run_sync(state: &AppState, force: bool) -> Option<ApiResult<Vec<SourceS
+ 
+ async fn run_sources(state: &AppState, force: bool) -> ApiResult<Vec<SourceStatus>> {
+     let mut statuses = load_statuses(state.settings_service.as_ref());
++    let mut previous: Vec<SourceStatus> = Vec::new();
++    let mut index_of: Vec<usize> = Vec::new();
+     for source in SOURCES {
+         let index = statuses
+             .iter()
+@@ -169,25 +173,94 @@ async fn run_sources(state: &AppState, force: bool) -> ApiResult<Vec<SourceStatu
+                 });
+                 statuses.len() - 1
+             });
+-        let previous = statuses[index].clone();
++        previous.push(statuses[index].clone());
++        index_of.push(index);
+         statuses[index].state = "running".into();
+         statuses[index].error = None;
+         persist_status(state, &source, &statuses[index]).await?;
++    }
+ 
+-        statuses[index] = match sync_source(state, source, &previous, force).await {
+-            Ok(status) => status,
+-            Err(error) => SourceStatus {
+-                state: failure_state(&error).into(),
+-                updated_at: Some(chrono::Utc::now().to_rfc3339()),
+-                error: Some(error),
+-                ..previous
+-            },
++    let mut fetched: Vec<Result<Fetched, String>> = Vec::new();
++    for (position, source) in SOURCES.iter().enumerate() {
++        fetched.push(fetch_source(state, *source, &previous[position], force).await);
++    }
++    // A brokerage account holds the CB cash and the CRV positions in one
++    // snapshot, so when one source has news the other is read in full as well.
++    if fetched
++        .iter()
++        .any(|result| matches!(result, Ok(Fetched::Fresh(_))))
++    {
++        for (position, source) in SOURCES.iter().enumerate() {
++            if matches!(fetched[position], Ok(Fetched::Unchanged(_))) {
++                fetched[position] =
++                    fetch_source(state, *source, &previous[position], true).await;
++            }
++        }
++    }
++
++    let position_of = |id: &str| SOURCES.iter().position(|source| source.id == id);
++    let cb_position = position_of("cb").expect("cb source");
++    let crv_position = position_of("crv").expect("crv source");
++    let mut applied: Vec<Option<Result<(usize, usize, usize), String>>> =
++        SOURCES.iter().map(|_| None).collect();
++    let cb_fresh = match &fetched[cb_position] {
++        Ok(Fetched::Fresh(fresh)) => Some(fresh),
++        _ => None,
++    };
++    let crv_fresh = match &fetched[crv_position] {
++        Ok(Fetched::Fresh(fresh)) => Some(fresh),
++        _ => None,
++    };
++    match (cb_fresh, crv_fresh) {
++        (Some(cb), crv) => {
++            let mut brokerage_accounts = None;
++            if let Some(crv) = crv {
++                match ledger::sync_brokerages(state, &cb.snapshot, &crv.snapshot, &cb.today).await {
++                    Ok(outcome) => {
++                        applied[crv_position] =
++                            Some(Ok((outcome.holdings, outcome.accounts, outcome.snapshots)));
++                        brokerage_accounts = Some(outcome.account_map);
++                    }
++                    Err(error) => applied[crv_position] = Some(Err(error)),
++                }
++            }
++            applied[cb_position] = Some(
++                ledger::sync_cb_ledger(state, &cb.snapshot, &cb.today, brokerage_accounts.as_ref())
++                    .await,
++            );
++        }
++        (None, Some(_)) => {
++            applied[crv_position] = Some(Err(
++                "O CB não respondeu; as posições do CRV esperam o caixa da corretora.".to_string(),
++            ));
++        }
++        (None, None) => {}
++    }
++
++    for (position, source) in SOURCES.iter().enumerate() {
++        let index = index_of[position];
++        let previous = previous[position].clone();
++        statuses[index] = match (&fetched[position], applied[position].take()) {
++            (Err(error), _) => failed_status(previous, error.clone()),
++            (Ok(_), Some(Err(error))) => failed_status(previous, error),
++            (Ok(Fetched::Unchanged(status)), _) => status.clone(),
++            (Ok(Fetched::Fresh(fresh)), Some(Ok(counts))) => fresh_status(source, fresh, counts),
++            (Ok(Fetched::Fresh(_)), None) => previous,
+         };
+-        persist_status(state, &source, &statuses[index]).await?;
++        persist_status(state, source, &statuses[index]).await?;
+     }
+     Ok(statuses)
+ }
+ 
++fn failed_status(previous: SourceStatus, error: String) -> SourceStatus {
++    SourceStatus {
++        state: failure_state(&error).into(),
++        updated_at: Some(chrono::Utc::now().to_rfc3339()),
++        error: Some(error),
++        ..previous
++    }
++}
++
+ /// A source whose token was never configured is not a failure to alarm about:
+ /// the operator simply has not finished the setup.
+ fn failure_state(error: &str) -> &'static str {
+@@ -209,12 +282,40 @@ fn snapshot_url(source: Source) -> String {
+     }
+ }
+ 
+-async fn sync_source(
++/// What one source returned: nothing new, or a validated snapshot to apply.
++enum Fetched {
++    Unchanged(SourceStatus),
++    Fresh(FreshSnapshot),
++}
++
++struct FreshSnapshot {
++    snapshot: Value,
++    high_watermark: String,
++    snapshot_id: Option<String>,
++    today: String,
++}
++
++fn fresh_status(source: &Source, fresh: &FreshSnapshot, counts: (usize, usize, usize)) -> SourceStatus {
++    SourceStatus {
++        source: source.id.into(),
++        state: "ready".into(),
++        updated_at: Some(chrono::Utc::now().to_rfc3339()),
++        snapshot_id: fresh.snapshot_id.clone(),
++        high_watermark: Some(fresh.high_watermark.clone()),
++        item_count: Some(counts.0),
++        accounts_imported: Some(counts.1),
++        snapshots_imported: Some(counts.2),
++        error: None,
++        applied_on: Some(fresh.today.clone()),
++    }
++}
++
++async fn fetch_source(
+     state: &AppState,
+     source: Source,
+     previous: &SourceStatus,
+     force: bool,
+-) -> Result<SourceStatus, String> {
++) -> Result<Fetched, String> {
+     let auth = AddonNetworkAuth {
+         auth_type: "bearer".into(),
+         secret_key: source.token_key.into(),
+@@ -234,12 +335,12 @@ async fn sync_source(
+         )
+         .await?;
+         if changed == Some(false) {
+-            return Ok(SourceStatus {
++            return Ok(Fetched::Unchanged(SourceStatus {
+                 updated_at: Some(chrono::Utc::now().to_rfc3339()),
+                 error: None,
+                 state: "ready".into(),
+                 ..previous.clone()
+-            });
++            }));
+         }
+     }
+ 
+@@ -263,29 +364,18 @@ async fn sync_source(
+         .get("high_watermark")
+         .and_then(Value::as_str)
+         .filter(|value| !value.is_empty())
+-        .ok_or_else(|| "Snapshot v4 inválido: checkpoint ausente.".to_string())?;
++        .ok_or_else(|| "Snapshot v4 inválido: checkpoint ausente.".to_string())?
++        .to_string();
+     let snapshot_id = snapshot
+         .get("snapshot_id")
+         .and_then(Value::as_str)
+         .map(str::to_string);
+-    let (item_count, accounts_imported, snapshots_imported) = match source.id {
+-        "cb" => sync_cb_accounts(state, &snapshot, &today).await?,
+-        "crv" => sync_crv_holdings(state, &snapshot, &today).await?,
+-        _ => return Err("Fonte de sincronização não suportada.".into()),
+-    };
+-
+-    Ok(SourceStatus {
+-        source: source.id.into(),
+-        state: "ready".into(),
+-        updated_at: Some(chrono::Utc::now().to_rfc3339()),
++    Ok(Fetched::Fresh(FreshSnapshot {
++        snapshot,
++        high_watermark,
+         snapshot_id,
+-        high_watermark: Some(high_watermark.to_string()),
+-        item_count: Some(item_count),
+-        accounts_imported: Some(accounts_imported),
+-        snapshots_imported: Some(snapshots_imported),
+-        error: None,
+-        applied_on: Some(today),
+-    })
++        today,
++    }))
+ }
+ 
+ fn today_in_user_timezone(state: &AppState) -> String {
+@@ -356,11 +446,15 @@ struct AccountSpec<'a> {
+     name: String,
+     currency: &'a str,
+     account_type: &'a str,
++    /// Wealthfolio `group`, applied when the account has none (never over the operator's choice).
++    group: Option<&'static str>,
++    tracking_mode: TrackingMode,
+ }
+ 
+ struct SyncedAccount {
+     id: String,
+     currency: String,
++    created: bool,
+ }
+ 
+ const CB_HISTORY_KEY_PREFIX: &str = "patrimonio_sync_cb_history_";
+@@ -653,378 +747,6 @@ fn income_activity_json(entry: &IncomeEntry, account_id: &str) -> Value {
+     activity
+ }
+ 
+-fn income_activity_matches(activity: &Activity, entry: &IncomeEntry, account_id: &str) -> bool {
+-    activity.account_id == account_id
+-        && activity.activity_type == entry.kind.activity_type()
+-        && activity.amount == Some(entry.amount)
+-        && activity.currency == entry.currency
+-        && activity.activity_date.date_naive() == entry.date
+-}
+-
+-/// Mirrors the CB's dividend, JCP and share-lending credits as income
+-/// activities on the account that received them. The CB stays the owner of the
+-/// cash: these activities carry no balance (the accounts are in holdings mode).
+-/// Only activities this importer created (source system and idempotency key)
+-/// are ever changed. Returns (created, removed).
+-async fn sync_cb_income(
+-    state: &AppState,
+-    entries: &[IncomeEntry],
+-    accounts: &std::collections::HashMap<String, String>,
+-) -> Result<(usize, usize), String> {
+-    let account_ids: Vec<String> = accounts.values().cloned().collect();
+-    let existing: Vec<Activity> = state
+-        .activity_service
+-        .get_activities_by_account_ids(&account_ids)
+-        .map_err(|_| "Não foi possível ler as atividades existentes.".to_string())?
+-        .into_iter()
+-        .filter(|activity| activity.source_system.as_deref() == Some(CB_SOURCE_SYSTEM))
+-        .collect();
+-
+-    let mut desired: std::collections::HashMap<&str, (&IncomeEntry, &str)> =
+-        std::collections::HashMap::new();
+-    for entry in entries {
+-        let Some(account_id) = accounts.get(&entry.account_source_id) else {
+-            continue;
+-        };
+-        // A dividend needs the asset it came from; without a ticker it is skipped.
+-        if entry.kind == IncomeKind::Dividend && entry.symbol.is_none() {
+-            continue;
+-        }
+-        desired.insert(entry.key.as_str(), (entry, account_id.as_str()));
+-    }
+-
+-    let mut kept: BTreeSet<String> = BTreeSet::new();
+-    let mut removed = 0;
+-    for activity in &existing {
+-        let key = activity.idempotency_key.as_deref();
+-        let unchanged = key
+-            .and_then(|key| desired.get(key))
+-            .is_some_and(|(entry, account_id)| income_activity_matches(activity, entry, account_id));
+-        if unchanged {
+-            if let Some(key) = key {
+-                kept.insert(key.to_string());
+-            }
+-            continue;
+-        }
+-        state
+-            .activity_service
+-            .delete_activity(activity.id.clone())
+-            .await
+-            .map_err(|_| "Não foi possível remover uma atividade desatualizada.".to_string())?;
+-        removed += 1;
+-    }
+-
+-    let mut created = 0;
+-    for (key, (entry, account_id)) in &desired {
+-        if kept.contains(*key) {
+-            continue;
+-        }
+-        let new_activity: NewActivity =
+-            serde_json::from_value(income_activity_json(entry, account_id))
+-                .map_err(|_| "Atividade de renda do CB inválida.".to_string())?;
+-        match state.activity_service.create_activity(new_activity).await {
+-            Ok(_) => created += 1,
+-            Err(_) => tracing::warn!("Patrimonio sync: could not create one CB income activity"),
+-        }
+-    }
+-    Ok((created, removed))
+-}
+-
+-async fn sync_cb_accounts(
+-    state: &AppState,
+-    snapshot: &Value,
+-    today: &str,
+-) -> Result<(usize, usize, usize), String> {
+-    let items = snapshot
+-        .get("items")
+-        .and_then(Value::as_array)
+-        .ok_or_else(|| "Snapshot CB v4 inválido: lista de itens ausente.".to_string())?;
+-    let coverage = snapshot.get("coverage");
+-    // The source must declare the three collections complete before anything is
+-    // applied or cleared, and the declared counts must match what arrived.
+-    for name in ["account", "cash_entry", "category"] {
+-        let declared = coverage
+-            .and_then(|coverage| coverage.get(name))
+-            .and_then(|value| value.get("count"))
+-            .and_then(Value::as_u64);
+-        let found = items
+-            .iter()
+-            .filter(|item| item.get("resource").and_then(Value::as_str) == Some(name))
+-            .count() as u64;
+-        let state_ok = coverage
+-            .and_then(|coverage| coverage.get(name))
+-            .and_then(|value| value.get("state"))
+-            .and_then(Value::as_str)
+-            == Some("complete");
+-        if !state_ok || declared != Some(found) {
+-            return Err(format!(
+-                "Snapshot CB v4 inválido: cobertura de {name} incompleta."
+-            ));
+-        }
+-    }
+-
+-    let reference_date = snapshot
+-        .get("snapshot_as_of")
+-        .and_then(Value::as_str)
+-        .map(str::to_string);
+-    let mut imported_sources = BTreeSet::new();
+-    let mut income_accounts: std::collections::HashMap<String, String> =
+-        std::collections::HashMap::new();
+-    let mut accounts_synced = 0;
+-    let mut snapshots_saved = 0;
+-    for item in items {
+-        if item.get("resource").and_then(Value::as_str) != Some("account") {
+-            continue;
+-        }
+-        let payload = item
+-            .get("payload")
+-            .ok_or_else(|| "Conta CB v4 inválida: dados ausentes.".to_string())?;
+-        let source_id = required_string(payload, "source_id", "ID da conta CB")?;
+-        let name = required_string(payload, "name", "nome da conta CB")?;
+-        let currency = required_string(payload, "currency", "moeda da conta CB")?;
+-        imported_sources.insert(marker(source_id));
+-
+-        let account_kind = payload.get("account_type").and_then(Value::as_str);
+-        // The first management phase imports cash only. Credit cards and
+-        // applications use different operational semantics in CB.
+-        if matches!(account_kind, Some("cartao_credito" | "aplicacao")) {
+-            continue;
+-        }
+-        // A missing balance is not a zero balance: nothing is written.
+-        let Some(balance) = payload.get("balance").and_then(Value::as_str) else {
+-            continue;
+-        };
+-        let balance_date = reference_date
+-            .clone()
+-            .or_else(|| {
+-                payload
+-                    .get("balance_as_of")
+-                    .and_then(Value::as_str)
+-                    .map(str::to_string)
+-            })
+-            .unwrap_or_else(|| today.to_string());
+-        let snapshot_date = NaiveDate::parse_from_str(&balance_date, "%Y-%m-%d")
+-            .map_err(|_| "Conta CB v4 inválida: data do saldo ausente.".to_string())?;
+-
+-        let account = ensure_source_account(
+-            state,
+-            &AccountSpec {
+-                marker: marker(source_id),
+-                provider: CB_PROVIDER,
+-                provider_account_id: source_id,
+-                name: format!("CB · {name}"),
+-                currency,
+-                account_type: account_types::CASH,
+-            },
+-        )
+-        .await?;
+-        accounts_synced += 1;
+-        income_accounts.insert(source_id.to_string(), account.id.clone());
+-        let current_balance = parse_decimal(balance, "saldo CB")?;
+-        let initial = payload
+-            .get("initial_balance")
+-            .and_then(Value::as_str)
+-            .and_then(|value| value.parse::<Decimal>().ok());
+-        let initial_date = payload
+-            .get("initial_balance_date")
+-            .and_then(Value::as_str)
+-            .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok());
+-        if let (Some(initial), Some(initial_date)) = (initial, initial_date) {
+-            let movements = realized_movements(items, source_id);
+-            match balance_history(initial, initial_date, &movements, snapshot_date, current_balance)
+-            {
+-                Some(series) => {
+-                    snapshots_saved +=
+-                        backfill_cb_history(state, &account.id, &account.currency, source_id, &series)
+-                            .await?;
+-                }
+-                None => tracing::warn!(
+-                    "Patrimonio sync: CB history does not reproduce the published balance; only today is written"
+-                ),
+-            }
+-        }
+-        save_source_snapshot(
+-            state,
+-            &account.id,
+-            &account.currency,
+-            snapshot_date,
+-            Vec::new(),
+-            vec![CashBalanceInput {
+-                currency: currency.to_string(),
+-                amount: current_balance,
+-            }],
+-        )
+-        .await?;
+-        snapshots_saved += 1;
+-    }
+-
+-    // Income is a convenience on top of the balances: a failure here is logged
+-    // and retried on the next import, and never undoes the balances above.
+-    match sync_cb_income(state, &parse_income_entries(items), &income_accounts).await {
+-        Ok((created, removed)) => {
+-            if created > 0 || removed > 0 {
+-                tracing::info!(
+-                    "Patrimonio sync: CB income activities created={created} removed={removed}"
+-                );
+-            }
+-        }
+-        Err(error) => tracing::warn!("Patrimonio sync: CB income not applied: {error}"),
+-    }
+-
+-    // Absence is only safe to reconcile because the source declared the account
+-    // collection complete (checked above): an account that left the source gets
+-    // a zero balance instead of keeping a stale one.
+-    let clear_date = reference_date
+-        .as_deref()
+-        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+-        .or_else(|| NaiveDate::parse_from_str(today, "%Y-%m-%d").ok())
+-        .ok_or_else(|| "Snapshot CB v4 inválido: data de referência ausente.".to_string())?;
+-    for stale in accounts_with_marker_prefix(state, &marker(CB_ACCOUNT_PREFIX))? {
+-        if stale
+-            .meta
+-            .as_deref()
+-            .is_some_and(|meta| imported_sources.contains(meta))
+-        {
+-            continue;
+-        }
+-        save_source_snapshot(
+-            state,
+-            &stale.id,
+-            &stale.currency,
+-            clear_date,
+-            Vec::new(),
+-            vec![CashBalanceInput {
+-                currency: stale.currency.clone(),
+-                amount: Decimal::ZERO,
+-            }],
+-        )
+-        .await?;
+-    }
+-
+-    Ok((items.len(), accounts_synced, snapshots_saved))
+-}
+-
+-async fn sync_crv_holdings(
+-    state: &AppState,
+-    snapshot: &Value,
+-    today: &str,
+-) -> Result<(usize, usize, usize), String> {
+-    let holdings = snapshot
+-        .get("holdings")
+-        .and_then(Value::as_array)
+-        .ok_or_else(|| "Snapshot CRV v4 inválido: posições ausentes.".to_string())?;
+-    // CRV declares the pilot as real, open equities only. Without a complete
+-    // declaration nothing is applied and nothing is cleared.
+-    if snapshot
+-        .get("coverage")
+-        .and_then(|coverage| coverage.get("holdings"))
+-        .and_then(|holdings| holdings.get("complete"))
+-        .and_then(Value::as_bool)
+-        != Some(true)
+-    {
+-        return Err("Snapshot CRV v4 inválido: cobertura de posições incompleta.".into());
+-    }
+-    let snapshot_date = snapshot
+-        .get("data_de_referencia")
+-        .and_then(Value::as_str)
+-        .or_else(|| snapshot.get("snapshot_as_of").and_then(Value::as_str))
+-        .unwrap_or(today);
+-    let snapshot_date = NaiveDate::parse_from_str(snapshot_date, "%Y-%m-%d")
+-        .map_err(|_| "Snapshot CRV v4 inválido: data de referência ausente.".to_string())?;
+-
+-    // One account per (CRV account, portfolio, currency), the way the add-on
+-    // always grouped them.
+-    struct Group {
+-        name: String,
+-        currency: String,
+-        positions: Vec<ManualHoldingInput>,
+-    }
+-    let mut groups: BTreeMap<String, Group> = BTreeMap::new();
+-    for holding in holdings {
+-        if holding.get("instrument_type").and_then(Value::as_str) != Some("equity") {
+-            return Err("Snapshot CRV v4 contém instrumento fora do escopo de ações.".into());
+-        }
+-        let account = required_string(holding, "account", "conta da posição CRV")?;
+-        let portfolio = required_string(holding, "portfolio", "carteira da posição CRV")?;
+-        let account_name = required_string(holding, "account_name", "nome da conta CRV")?;
+-        let symbol = required_string(holding, "instrument", "instrumento CRV")?;
+-        let currency = required_string(holding, "currency", "moeda da posição CRV")?;
+-        let market = holding
+-            .get("market")
+-            .and_then(Value::as_str)
+-            .unwrap_or_default();
+-        let exchange_mic = market_to_mic(market);
+-        let quantity = parse_decimal_field(holding, "quantity", "quantidade CRV")?;
+-        let average_cost = parse_decimal_field(holding, "average_cost", "custo médio CRV")?;
+-        let group = groups
+-            .entry(format!("{account}:{portfolio}:{currency}"))
+-            .or_insert_with(|| Group {
+-                name: format!("CRV · {account_name} · {portfolio}"),
+-                currency: currency.to_string(),
+-                positions: Vec::new(),
+-            });
+-        group.positions.push(crv_holding_input(
+-            symbol,
+-            exchange_mic,
+-            currency,
+-            quantity,
+-            average_cost,
+-        ));
+-    }
+-
+-    let mut active = BTreeSet::new();
+-    let mut snapshots_saved = 0;
+-    for (key, group) in groups {
+-        let source_id = format!("{CRV_ACCOUNT_PREFIX}{key}");
+-        active.insert(marker(&source_id));
+-        let account = ensure_source_account(
+-            state,
+-            &AccountSpec {
+-                marker: marker(&source_id),
+-                provider: CRV_PROVIDER,
+-                provider_account_id: &source_id,
+-                name: group.name,
+-                currency: &group.currency,
+-                account_type: account_types::SECURITIES,
+-            },
+-        )
+-        .await?;
+-        save_source_snapshot(
+-            state,
+-            &account.id,
+-            &account.currency,
+-            snapshot_date,
+-            group.positions,
+-            Vec::new(),
+-        )
+-        .await?;
+-        snapshots_saved += 1;
+-    }
+-
+-    // A portfolio that no longer holds anything gets an empty snapshot, which is
+-    // what the complete declaration above allows.
+-    for stale in accounts_with_marker_prefix(state, &marker(CRV_ACCOUNT_PREFIX))? {
+-        if stale
+-            .meta
+-            .as_deref()
+-            .is_some_and(|meta| active.contains(meta))
+-        {
+-            continue;
+-        }
+-        save_source_snapshot(
+-            state,
+-            &stale.id,
+-            &stale.currency,
+-            snapshot_date,
+-            Vec::new(),
+-            Vec::new(),
+-        )
+-        .await?;
+-    }
+-
+-    Ok((holdings.len(), snapshots_saved, snapshots_saved))
+-}
+-
+ /// Builds a holding without pinning it to a synthetic source id.
+ ///
+ /// `ManualSnapshotService` resolves the canonical `(symbol, MIC, currency)` key
+@@ -1105,11 +827,13 @@ async fn ensure_source_account(
+             && existing.provider.as_deref() == Some(spec.provider)
+             && existing.provider_account_id.as_deref() == Some(spec.provider_account_id)
+             && existing.is_active
+-            && existing.tracking_mode == TrackingMode::Holdings;
++            && existing.tracking_mode == spec.tracking_mode
++            && (spec.group.is_none() || existing.group.is_some());
+         if unchanged {
+             return Ok(SyncedAccount {
+                 id: existing.id.clone(),
+                 currency: existing.currency.clone(),
++                created: false,
+             });
+         }
+         let updated = state
+@@ -1118,11 +842,14 @@ async fn ensure_source_account(
+                 id: Some(existing.id.clone()),
+                 name: spec.name.clone(),
+                 account_type: spec.account_type.to_string(),
+-                group: existing.group.clone(),
++                group: existing
++                    .group
++                    .clone()
++                    .or_else(|| spec.group.map(str::to_string)),
+                 is_default: false,
+                 is_active: true,
+                 is_archived: Some(false),
+-                tracking_mode: Some(TrackingMode::Holdings),
++                tracking_mode: Some(spec.tracking_mode),
+                 platform_id: existing.platform_id.clone(),
+                 account_number: existing.account_number.clone(),
+                 meta: Some(spec.marker.clone()),
+@@ -1134,6 +861,7 @@ async fn ensure_source_account(
+         return Ok(SyncedAccount {
+             id: updated.id,
+             currency: existing.currency.clone(),
++            created: false,
+         });
+     }
+ 
+@@ -1144,7 +872,7 @@ async fn ensure_source_account(
+             id: Some(stable_id("patrimonio-v2", &spec.marker)),
+             name: spec.name.clone(),
+             account_type: spec.account_type.to_string(),
+-            group: None,
++            group: spec.group.map(str::to_string),
+             currency: spec.currency.to_string(),
+             is_default: false,
+             is_active: true,
+@@ -1154,13 +882,14 @@ async fn ensure_source_account(
+             provider: Some(spec.provider.to_string()),
+             provider_account_id: Some(spec.provider_account_id.to_string()),
+             is_archived: false,
+-            tracking_mode: TrackingMode::Holdings,
++            tracking_mode: spec.tracking_mode,
+         })
+         .await
+         .map_err(|_| "Não foi possível criar a conta importada.".to_string())?;
+     Ok(SyncedAccount {
+         id: created.id,
+         currency: spec.currency.to_string(),
++        created: true,
+     })
+ }
+ 
+@@ -1574,6 +1303,8 @@ mod tests {
+             name: "CB · Conta".into(),
+             currency: "BRL",
+             account_type: account_types::CASH,
++            group: None,
++            tracking_mode: TrackingMode::Holdings,
+         }
+     }
+ 
+diff --git a/apps/server/src/api/patrimonio_sync/ledger.rs b/apps/server/src/api/patrimonio_sync/ledger.rs
+new file mode 100644
+index 000000000..24628f1b1
+--- /dev/null
++++ b/apps/server/src/api/patrimonio_sync/ledger.rs
+@@ -0,0 +1,1602 @@
++//! Phase 3 of the CB/CRV import: what an "account" means in each system.
++//!
++//! * A CB bank account, savings application or credit card becomes a
++//!   Wealthfolio account tracked by TRANSACTIONS: the realized CB entries are
++//!   mirrored as activities, so the balance, the history and Spending come from
++//!   the ledger. An account is only switched after the ledger reproduces the
++//!   balance the CB publishes, to the cent.
++//! * A brokerage is one Wealthfolio account per (broker, currency) holding the
++//!   cash the CB publishes and the positions the CRV publishes in the same
++//!   snapshot. It stays in HOLDINGS mode: the CB settles stock trades by day
++//!   and nothing in it ties a settlement to a CRV trade.
++//!
++//! Everything here is read-only on the sources, idempotent, and only touches
++//! activities this importer wrote (source system and idempotency key).
++
++use super::*;
++use std::collections::HashMap;
++
++use wealthfolio_core::{activities::ActivityBulkMutationRequest, taxonomies::NewCategory};
++use wealthfolio_spending::activity_assignments::BulkCategoryAssignment;
++
++const SPENDING_TAXONOMY: &str = "spending_categories";
++const INCOME_TAXONOMY: &str = "income_sources";
++
++const GROUP_CHECKING: &str = "Contas correntes";
++const GROUP_SAVINGS: &str = "Aplicações";
++const GROUP_CARDS: &str = "Cartões";
++const GROUP_BROKERAGE: &str = "Corretoras";
++
++const BULK_CHUNK: usize = 150;
++
++const BROKERS: [(&str, &str); 5] = [
++    ("genial", "Genial"),
++    ("xp", "XP"),
++    ("avenue", "Avenue"),
++    ("nomad", "Nomad"),
++    ("revolut", "Revolut"),
++];
++/// Institution names the CB uses for a broker under another name.
++const BROKER_ALIASES: [(&str, &str); 1] = [("scpxpinvestimentos", "xp")];
++
++const CATEGORY_COLORS: [&str; 8] = [
++    "#8abceb", "#f2b36d", "#7fc8a9", "#d98fb0", "#b3a2e0", "#e0c85f", "#7fb8c9", "#c98f7f",
++];
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum CbKind {
++    Checking,
++    Savings,
++    Card,
++}
++
++impl CbKind {
++    fn group(self) -> &'static str {
++        match self {
++            CbKind::Checking => GROUP_CHECKING,
++            CbKind::Savings => GROUP_SAVINGS,
++            CbKind::Card => GROUP_CARDS,
++        }
++    }
++
++    fn account_type(self) -> &'static str {
++        match self {
++            CbKind::Card => account_types::CREDIT_CARD,
++            _ => account_types::CASH,
++        }
++    }
++}
++
++#[derive(Clone, Debug)]
++pub(super) struct CbAccount {
++    pub source_id: String,
++    pub name: String,
++    pub currency: String,
++    pub kind: CbKind,
++    pub owner: String,
++    pub institution: String,
++    pub brokerage: bool,
++    pub initial: Option<Decimal>,
++    pub initial_date: Option<NaiveDate>,
++    pub balance: Option<Decimal>,
++    pub balance_as_of: Option<String>,
++}
++
++pub(super) fn parse_cb_accounts(items: &[Value]) -> Result<Vec<CbAccount>, String> {
++    let mut accounts = Vec::new();
++    for item in items {
++        if item.get("resource").and_then(Value::as_str) != Some("account") {
++            continue;
++        }
++        let payload = item
++            .get("payload")
++            .ok_or_else(|| "Conta CB v4 inválida: dados ausentes.".to_string())?;
++        let text = |key: &str| {
++            payload
++                .get(key)
++                .and_then(Value::as_str)
++                .unwrap_or_default()
++                .trim()
++                .to_string()
++        };
++        let kind = match payload.get("account_type").and_then(Value::as_str) {
++            Some("cartao_credito") => CbKind::Card,
++            Some("aplicacao") => CbKind::Savings,
++            _ => CbKind::Checking,
++        };
++        accounts.push(CbAccount {
++            source_id: required_string(payload, "source_id", "ID da conta CB")?.to_string(),
++            name: required_string(payload, "name", "nome da conta CB")?.to_string(),
++            currency: required_string(payload, "currency", "moeda da conta CB")?.to_string(),
++            kind,
++            owner: text("owner_name"),
++            institution: text("institution_name"),
++            brokerage: payload.get("institution_type").and_then(Value::as_str)
++                == Some("Corretora"),
++            initial: payload
++                .get("initial_balance")
++                .and_then(Value::as_str)
++                .and_then(|value| value.parse::<Decimal>().ok()),
++            initial_date: payload
++                .get("initial_balance_date")
++                .and_then(Value::as_str)
++                .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()),
++            balance: payload
++                .get("balance")
++                .and_then(Value::as_str)
++                .and_then(|value| value.parse::<Decimal>().ok()),
++            balance_as_of: payload
++                .get("balance_as_of")
++                .and_then(Value::as_str)
++                .map(str::to_string),
++        });
++    }
++    Ok(accounts)
++}
++
++/// `Titular · Instituição · Conta`: "Conta 01" alone exists three times.
++pub(super) fn ledger_account_name(account: &CbAccount) -> String {
++    [
++        account.owner.as_str(),
++        account.institution.as_str(),
++        account.name.as_str(),
++    ]
++    .iter()
++    .filter(|part| !part.trim().is_empty())
++    .copied()
++    .collect::<Vec<_>>()
++    .join(" · ")
++}
++
++fn compact(text: &str) -> String {
++    fold_text(text)
++        .chars()
++        .filter(|c| c.is_ascii_alphanumeric())
++        .collect()
++}
++
++/// The broker an institution or CRV account name stands for.
++pub(super) fn broker_key(raw: &str) -> String {
++    let compact = compact(raw);
++    for (alias, key) in BROKER_ALIASES {
++        if compact == alias {
++            return key.to_string();
++        }
++    }
++    compact
++}
++
++fn broker_display(key: &str, fallback: &str) -> String {
++    BROKERS
++        .iter()
++        .find(|(known, _)| *known == key)
++        .map(|(_, title)| title.to_string())
++        .unwrap_or_else(|| fallback.trim().to_string())
++}
++
++fn short_hash(text: &str) -> String {
++    let mut hasher = Sha256::new();
++    hasher.update(text.as_bytes());
++    format!("{:x}", hasher.finalize())[..12].to_string()
++}
++
++// ---------------------------------------------------------------------------
++// CB entries
++// ---------------------------------------------------------------------------
++
++#[derive(Clone, Debug)]
++pub(super) struct CbCategory {
++    pub name: String,
++}
++
++#[derive(Clone, Debug)]
++pub(super) struct LedgerEntry {
++    pub key: String,
++    pub account: String,
++    pub date: NaiveDate,
++    pub amount: Decimal,
++    pub currency: String,
++    pub income: bool,
++    /// Transfers and investment moves: anything the CB does not call "gerencial".
++    pub transfer_like: bool,
++    pub category_id: String,
++    pub transfer_id: Option<String>,
++    pub description: String,
++}
++
++pub(super) fn parse_categories(items: &[Value]) -> HashMap<String, CbCategory> {
++    items
++        .iter()
++        .filter(|item| item.get("resource").and_then(Value::as_str) == Some("category"))
++        .filter_map(|item| item.get("payload"))
++        .filter_map(|payload| {
++            Some((
++                payload.get("source_id")?.as_str()?.to_string(),
++                CbCategory {
++                    name: payload.get("name")?.as_str()?.to_string(),
++                },
++            ))
++        })
++        .collect()
++}
++
++/// Realized entries only: planned and overdue ones have not moved money yet.
++pub(super) fn parse_ledger_entries(items: &[Value]) -> Vec<LedgerEntry> {
++    items
++        .iter()
++        .filter(|item| item.get("resource").and_then(Value::as_str) == Some("cash_entry"))
++        .filter_map(|item| {
++            let key = item.get("source_id").and_then(Value::as_str)?;
++            let payload = item.get("payload")?;
++            if payload.get("status").and_then(Value::as_str) != Some("realizado") {
++                return None;
++            }
++            let income = match payload.get("entry_type").and_then(Value::as_str)? {
++                "receita" => true,
++                "despesa" => false,
++                _ => return None,
++            };
++            let date = NaiveDate::parse_from_str(
++                payload.get("realized_date")?.as_str()?,
++                "%Y-%m-%d",
++            )
++            .ok()?;
++            let amount = payload
++                .get("realized_amount")?
++                .as_str()?
++                .parse::<Decimal>()
++                .ok()?;
++            Some(LedgerEntry {
++                key: key.to_string(),
++                account: payload.get("account_id")?.as_str()?.to_string(),
++                date,
++                amount,
++                currency: payload
++                    .get("currency")
++                    .and_then(Value::as_str)
++                    .unwrap_or("BRL")
++                    .to_string(),
++                income,
++                transfer_like: payload.get("category_kind").and_then(Value::as_str)
++                    != Some("gerencial"),
++                category_id: payload
++                    .get("category_id")
++                    .and_then(Value::as_str)
++                    .unwrap_or_default()
++                    .to_string(),
++                transfer_id: payload
++                    .get("transfer_id")
++                    .and_then(Value::as_str)
++                    .map(str::to_string),
++                description: payload
++                    .get("description")
++                    .and_then(Value::as_str)
++                    .unwrap_or_default()
++                    .to_string(),
++            })
++        })
++        .collect()
++}
++
++/// Which reading of the opening day reproduces the balance the CB publishes:
++/// `Some(false)` when entries dated on the opening day are already in the
++/// opening balance, `Some(true)` when they come on top of it, `None` when
++/// neither does (the ledger is then not trusted).
++pub(super) fn opening_day_reading(
++    initial: Decimal,
++    initial_date: NaiveDate,
++    movements: &[(NaiveDate, Decimal)],
++    through: NaiveDate,
++    expected_final: Decimal,
++) -> Option<bool> {
++    [false, true].into_iter().find(|include_opening_day| {
++        let total: Decimal = movements
++            .iter()
++            .filter(|(date, _)| {
++                *date <= through
++                    && if *include_opening_day {
++                        *date >= initial_date
++                    } else {
++                        *date > initial_date
++                    }
++            })
++            .map(|(_, amount)| *amount)
++            .sum();
++        initial + total == expected_final
++    })
++}
++
++#[derive(Clone, Debug)]
++pub(super) struct Desired {
++    pub key: String,
++    pub account_id: String,
++    pub activity_type: String,
++    pub amount: Decimal,
++    pub currency: String,
++    pub date: NaiveDate,
++    pub group_id: Option<String>,
++    pub json: Value,
++    /// Taxonomy, CB category id and name to label this activity with.
++    pub category: Option<(&'static str, String, String)>,
++}
++
++fn activity_date(date: NaiveDate) -> String {
++    format!("{date}T12:00:00.000Z")
++}
++
++fn base_json(
++    key: &str,
++    account_id: &str,
++    activity_type: &str,
++    date: NaiveDate,
++    currency: &str,
++    amount: Decimal,
++    notes: String,
++) -> Value {
++    serde_json::json!({
++        "accountId": account_id,
++        "activityType": activity_type,
++        "activityDate": activity_date(date),
++        "currency": currency,
++        "amount": amount.to_string(),
++        "status": "POSTED",
++        "notes": notes,
++        "sourceSystem": CB_SOURCE_SYSTEM,
++        "sourceRecordId": key,
++        "idempotencyKey": key,
++    })
++}
++
++/// The balance a CB account opens with, as one neutral cash movement dated on
++/// the opening day. CREDIT without a subtype adds cash and is neither income
++/// nor spending; a negative opening (an owed card) is a charge dated the same day.
++pub(super) fn opening_activity(
++    account: &CbAccount,
++    account_id: &str,
++    initial: Decimal,
++    initial_date: NaiveDate,
++) -> Option<Desired> {
++    if initial.is_zero() {
++        return None;
++    }
++    let key = format!("controle-bancario:opening:{}", account.source_id);
++    let (activity_type, amount) = if initial > Decimal::ZERO {
++        ("CREDIT", initial)
++    } else {
++        ("WITHDRAWAL", -initial)
++    };
++    let json = base_json(
++        &key,
++        account_id,
++        activity_type,
++        initial_date,
++        &account.currency,
++        amount,
++        "CB: saldo inicial".to_string(),
++    );
++    Some(Desired {
++        key,
++        account_id: account_id.to_string(),
++        activity_type: activity_type.to_string(),
++        amount,
++        currency: account.currency.clone(),
++        date: initial_date,
++        group_id: None,
++        json,
++        category: None,
++    })
++}
++
++/// One CB entry as one activity of the ledger. `group` is the transfer group
++/// and whether the other leg lives outside the ledger.
++pub(super) fn entry_activity(
++    entry: &LedgerEntry,
++    kind: CbKind,
++    account_id: &str,
++    category_name: &str,
++    group: Option<(String, bool)>,
++) -> Desired {
++    let card = kind == CbKind::Card;
++    let mut subtype: Option<&str> = None;
++    let mut asset: Option<Value> = None;
++    let mut taxonomy: Option<&'static str> = None;
++    let activity_type = if entry.transfer_like {
++        if entry.income {
++            "TRANSFER_IN"
++        } else {
++            "TRANSFER_OUT"
++        }
++    } else if !entry.income {
++        taxonomy = Some(SPENDING_TAXONOMY);
++        "WITHDRAWAL"
++    } else if card {
++        subtype = Some("REFUND");
++        taxonomy = Some(SPENDING_TAXONOMY);
++        "CREDIT"
++    } else if is_income_category(category_name) {
++        // Dividends, JCP and share lending keep their income type; a dividend
++        // with no ticker still moved cash, so it is a plain deposit.
++        let kind = income_kind(&entry.description);
++        let symbol = ticker_from_description(&entry.description);
++        match (kind, symbol) {
++            (IncomeKind::Dividend, None) => {
++                taxonomy = Some(INCOME_TAXONOMY);
++                "DEPOSIT"
++            }
++            (kind, symbol) => {
++                if let Some(symbol) = symbol {
++                    asset = Some(serde_json::json!({ "symbol": symbol, "exchangeMic": B3_MIC }));
++                }
++                if kind == IncomeKind::Lending {
++                    taxonomy = Some(INCOME_TAXONOMY);
++                }
++                kind.activity_type()
++            }
++        }
++    } else {
++        taxonomy = Some(INCOME_TAXONOMY);
++        "DEPOSIT"
++    };
++
++    let mut json = base_json(
++        &entry.key,
++        account_id,
++        activity_type,
++        entry.date,
++        &entry.currency,
++        entry.amount,
++        format!("CB: {}", entry.description),
++    );
++    if let Some(subtype) = subtype {
++        json["subtype"] = Value::String(subtype.to_string());
++    }
++    if let Some(asset) = asset {
++        json["asset"] = asset;
++    }
++    let group_id = group.as_ref().map(|(id, _)| id.clone());
++    if let Some((id, external)) = &group {
++        json["sourceGroupId"] = Value::String(id.clone());
++        if *external {
++            json["metadata"] = Value::String(
++                serde_json::json!({ "flow": { "is_external": true } }).to_string(),
++            );
++        }
++    }
++    Desired {
++        key: entry.key.clone(),
++        account_id: account_id.to_string(),
++        activity_type: activity_type.to_string(),
++        amount: entry.amount,
++        currency: entry.currency.clone(),
++        date: entry.date,
++        group_id,
++        json,
++        category: taxonomy
++            .filter(|_| !entry.category_id.is_empty())
++            .map(|taxonomy| (taxonomy, entry.category_id.clone(), category_name.to_string())),
++    }
++}
++
++/// Transfer groups that are a real pair inside the ledger: two legs on two
++/// accounts, one in and one out, same currency and same amount. Anything else
++/// is a single leg whose other side is outside the ledger.
++pub(super) fn paired_transfer_groups(entries: &[&LedgerEntry]) -> BTreeSet<String> {
++    let mut by_group: BTreeMap<&str, Vec<&LedgerEntry>> = BTreeMap::new();
++    for entry in entries {
++        if entry.transfer_like {
++            if let Some(id) = entry.transfer_id.as_deref() {
++                by_group.entry(id).or_default().push(entry);
++            }
++        }
++    }
++    by_group
++        .into_iter()
++        .filter(|(_, legs)| {
++            legs.len() == 2
++                && legs[0].account != legs[1].account
++                && legs[0].income != legs[1].income
++                && legs[0].currency == legs[1].currency
++                && legs[0].amount == legs[1].amount
++        })
++        .map(|(id, _)| id.to_string())
++        .collect()
++}
++
++fn desired_matches(activity: &Activity, desired: &Desired) -> bool {
++    activity.account_id == desired.account_id
++        && activity.activity_type == desired.activity_type
++        && activity.amount == Some(desired.amount)
++        && activity.currency == desired.currency
++        && activity.activity_date.date_naive() == desired.date
++        && activity.source_group_id == desired.group_id
++}
++
++fn cb_activities(state: &AppState, managed: &BTreeSet<String>) -> Result<Vec<Activity>, String> {
++    let all = state
++        .activity_service
++        .get_activities_including_archived_accounts()
++        .or_else(|_| {
++            let ids: Vec<String> = managed.iter().cloned().collect();
++            state.activity_service.get_activities_by_account_ids(&ids)
++        })
++        .map_err(|_| "Não foi possível ler as atividades existentes.".to_string())?;
++    Ok(all
++        .into_iter()
++        .filter(|activity| activity.source_system.as_deref() == Some(CB_SOURCE_SYSTEM))
++        .collect())
++}
++
++/// Brings the CB activities to exactly `desired` on the managed accounts. An
++/// activity that changed, or that sits on another account than it should (an
++/// account that was archived and replaced), is deleted and recreated; one that
++/// the CB no longer publishes is deleted. Returns (created, removed, failed).
++async fn reconcile_activities(
++    state: &AppState,
++    desired: &[Desired],
++    managed: &BTreeSet<String>,
++) -> Result<(usize, usize, usize), String> {
++    let by_key: HashMap<&str, &Desired> =
++        desired.iter().map(|item| (item.key.as_str(), item)).collect();
++    let mut failed = 0;
++
++    let mut stale: Vec<String> = Vec::new();
++    for activity in cb_activities(state, managed)? {
++        let key = activity.idempotency_key.as_deref();
++        let keep = key
++            .and_then(|key| by_key.get(key))
++            .is_some_and(|item| desired_matches(&activity, item));
++        let delete = !keep
++            && (key.is_some_and(|key| by_key.contains_key(key))
++                || managed.contains(&activity.account_id));
++        if delete {
++            stale.push(activity.id);
++        }
++    }
++    let removed = stale.len();
++    for chunk in stale.chunks(BULK_CHUNK) {
++        let result = state
++            .activity_service
++            .bulk_mutate_activities(ActivityBulkMutationRequest {
++                creates: Vec::new(),
++                updates: Vec::new(),
++                delete_ids: chunk.to_vec(),
++            })
++            .await
++            .map_err(|_| "Não foi possível remover atividades desatualizadas.".to_string())?;
++        failed += result.errors.len();
++    }
++
++    // Deleting one leg of a pair can take the other with it, so what exists is
++    // read again before deciding what to create.
++    let present: BTreeSet<String> = cb_activities(state, managed)?
++        .into_iter()
++        .filter_map(|activity| activity.idempotency_key)
++        .collect();
++    let mut creates: Vec<NewActivity> = Vec::new();
++    for item in desired {
++        if present.contains(&item.key) {
++            continue;
++        }
++        match serde_json::from_value::<NewActivity>(item.json.clone()) {
++            Ok(new_activity) => creates.push(new_activity),
++            Err(_) => failed += 1,
++        }
++    }
++    let created_total = creates.len();
++    let mut created = 0;
++    while !creates.is_empty() {
++        let rest = creates.split_off(creates.len().min(BULK_CHUNK));
++        let batch = std::mem::replace(&mut creates, rest);
++        let attempted = batch.len();
++        let result = state
++            .activity_service
++            .bulk_mutate_activities(ActivityBulkMutationRequest {
++                creates: batch,
++                updates: Vec::new(),
++                delete_ids: Vec::new(),
++            })
++            .await
++            .map_err(|_| "Não foi possível gravar as atividades do CB.".to_string())?;
++        failed += result.errors.len();
++        created += attempted.saturating_sub(result.errors.len());
++    }
++    debug_assert!(created <= created_total);
++    Ok((created, removed, failed))
++}
++
++// ---------------------------------------------------------------------------
++// Categories
++// ---------------------------------------------------------------------------
++
++fn category_id(taxonomy: &str, cb_category_id: &str) -> String {
++    format!("cb_{}", short_hash(&format!("{taxonomy}:{cb_category_id}")))
++}
++
++/// Makes sure every CB category in use exists in the matching taxonomy, under a
++/// stable id, and returns the Wealthfolio id of each (taxonomy, CB category).
++async fn ensure_categories(
++    state: &AppState,
++    wanted: &BTreeMap<(&'static str, String), String>,
++) -> HashMap<(&'static str, String), String> {
++    let mut resolved = HashMap::new();
++    for taxonomy in [SPENDING_TAXONOMY, INCOME_TAXONOMY] {
++        let existing: BTreeSet<String> = match state.taxonomy_service.get_taxonomy(taxonomy) {
++            Ok(Some(found)) => found
++                .categories
++                .into_iter()
++                .map(|category| category.id)
++                .collect(),
++            _ => {
++                tracing::warn!("Patrimonio sync: taxonomy {taxonomy} not found; categories skipped");
++                continue;
++            }
++        };
++        let mut index = 0;
++        for ((wanted_taxonomy, cb_id), name) in wanted {
++            if *wanted_taxonomy != taxonomy {
++                continue;
++            }
++            let id = category_id(taxonomy, cb_id);
++            index += 1;
++            if !existing.contains(&id) {
++                let created = state
++                    .taxonomy_service
++                    .create_category(NewCategory {
++                        id: Some(id.clone()),
++                        taxonomy_id: taxonomy.to_string(),
++                        parent_id: None,
++                        name: name.clone(),
++                        key: id.clone(),
++                        color: CATEGORY_COLORS[index % CATEGORY_COLORS.len()].to_string(),
++                        description: Some("Categoria do Controle Bancário".to_string()),
++                        sort_order: 1000 + index as i32,
++                        icon: None,
++                    })
++                    .await;
++                if created.is_err() {
++                    tracing::warn!("Patrimonio sync: could not create one CB category");
++                    continue;
++                }
++            }
++            resolved.insert((taxonomy, cb_id.clone()), id);
++        }
++    }
++    resolved
++}
++
++/// Labels the CB activities with their CB category. Best effort: an activity
++/// that already has a category (the operator's choice wins) or whose account is
++/// outside the Spending scope is left alone.
++async fn assign_categories(state: &AppState, desired: &[Desired], managed: &BTreeSet<String>) {
++    let settings = match state.spending_settings_service.get().await {
++        Ok(settings) if settings.enabled => settings,
++        _ => return,
++    };
++    let wanted: BTreeMap<(&'static str, String), String> = desired
++        .iter()
++        .filter(|item| settings.account_ids.contains(&item.account_id))
++        .filter_map(|item| item.category.clone())
++        .map(|(taxonomy, id, name)| ((taxonomy, id), name))
++        .collect();
++    if wanted.is_empty() {
++        return;
++    }
++    let resolved = ensure_categories(state, &wanted).await;
++    let Ok(activities) = cb_activities(state, managed) else {
++        return;
++    };
++    let ids: HashMap<String, String> = activities
++        .into_iter()
++        .filter_map(|activity| Some((activity.idempotency_key?, activity.id)))
++        .collect();
++    let candidate_ids: Vec<String> = desired
++        .iter()
++        .filter(|item| item.category.is_some())
++        .filter_map(|item| ids.get(&item.key).cloned())
++        .collect();
++    let mut labelled: BTreeSet<String> = BTreeSet::new();
++    for chunk in candidate_ids.chunks(BULK_CHUNK) {
++        if let Ok(rows) = state.cash_activity_service.get_by_activity_ids(chunk).await {
++            for row in rows {
++                if !row.assignments.is_empty() {
++                    labelled.insert(row.activity.id);
++                }
++            }
++        }
++    }
++    let mut assignments: Vec<BulkCategoryAssignment> = Vec::new();
++    for item in desired {
++        let Some((taxonomy, cb_id, _)) = &item.category else {
++            continue;
++        };
++        let (Some(activity_id), Some(category)) =
++            (ids.get(&item.key), resolved.get(&(*taxonomy, cb_id.clone())))
++        else {
++            continue;
++        };
++        if labelled.contains(activity_id) {
++            continue;
++        }
++        assignments.push(BulkCategoryAssignment {
++            activity_id: activity_id.clone(),
++            taxonomy_id: taxonomy.to_string(),
++            category_id: category.clone(),
++        });
++    }
++    let mut applied = 0;
++    for chunk in assignments.chunks(BULK_CHUNK) {
++        match state.cash_activity_service.bulk_assign_categories(chunk).await {
++            Ok(done) => applied += done.len(),
++            Err(_) => {
++                // One rejected row rejects the batch: retry row by row.
++                for one in chunk {
++                    if state
++                        .cash_activity_service
++                        .bulk_assign_categories(std::slice::from_ref(one))
++                        .await
++                        .is_ok()
++                    {
++                        applied += 1;
++                    }
++                }
++            }
++        }
++    }
++    if applied > 0 {
++        tracing::info!("Patrimonio sync: CB categories assigned={applied}");
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Accounts
++// ---------------------------------------------------------------------------
++
++async fn archive_account(state: &AppState, existing: &Account) -> Result<(), String> {
++    state
++        .account_service
++        .update_account(AccountUpdate {
++            id: Some(existing.id.clone()),
++            name: existing.name.clone(),
++            account_type: existing.account_type.clone(),
++            group: existing.group.clone(),
++            is_default: false,
++            is_active: existing.is_active,
++            is_archived: Some(true),
++            tracking_mode: Some(existing.tracking_mode),
++            platform_id: existing.platform_id.clone(),
++            account_number: existing.account_number.clone(),
++            meta: existing.meta.clone(),
++            provider: existing.provider.clone(),
++            provider_account_id: existing.provider_account_id.clone(),
++        })
++        .await
++        .map_err(|_| "Não foi possível arquivar a conta substituída.".to_string())?;
++    Ok(())
++}
++
++struct BrokerGroup {
++    marker_source_id: String,
++    display: String,
++    currency: String,
++    positions: Vec<ManualHoldingInput>,
++    crv_holdings: usize,
++    cb_accounts: Vec<CbAccount>,
++}
++
++pub(super) struct CrvGroup {
++    pub account: String,
++    pub account_name: String,
++    pub portfolio: String,
++    pub currency: String,
++    pub positions: Vec<ManualHoldingInput>,
++}
++
++/// One entry per (CRV account, portfolio, currency), as the add-on always grouped them.
++pub(super) fn parse_crv_groups(snapshot: &Value) -> Result<(NaiveDate, Vec<CrvGroup>, usize), String> {
++    let holdings = snapshot
++        .get("holdings")
++        .and_then(Value::as_array)
++        .ok_or_else(|| "Snapshot CRV v4 inválido: posições ausentes.".to_string())?;
++    // CRV declares the pilot as real, open equities only. Without a complete
++    // declaration nothing is applied and nothing is cleared.
++    if snapshot
++        .get("coverage")
++        .and_then(|coverage| coverage.get("holdings"))
++        .and_then(|holdings| holdings.get("complete"))
++        .and_then(Value::as_bool)
++        != Some(true)
++    {
++        return Err("Snapshot CRV v4 inválido: cobertura de posições incompleta.".into());
++    }
++    let date = snapshot
++        .get("data_de_referencia")
++        .and_then(Value::as_str)
++        .or_else(|| snapshot.get("snapshot_as_of").and_then(Value::as_str))
++        .ok_or_else(|| "Snapshot CRV v4 inválido: data de referência ausente.".to_string())?;
++    let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
++        .map_err(|_| "Snapshot CRV v4 inválido: data de referência ausente.".to_string())?;
++
++    let mut groups: BTreeMap<String, CrvGroup> = BTreeMap::new();
++    for holding in holdings {
++        if holding.get("instrument_type").and_then(Value::as_str) != Some("equity") {
++            return Err("Snapshot CRV v4 contém instrumento fora do escopo de ações.".into());
++        }
++        let account = required_string(holding, "account", "conta da posição CRV")?;
++        let portfolio = required_string(holding, "portfolio", "carteira da posição CRV")?;
++        let account_name = required_string(holding, "account_name", "nome da conta CRV")?;
++        let symbol = required_string(holding, "instrument", "instrumento CRV")?;
++        let currency = required_string(holding, "currency", "moeda da posição CRV")?;
++        let market = holding
++            .get("market")
++            .and_then(Value::as_str)
++            .unwrap_or_default();
++        let quantity = parse_decimal_field(holding, "quantity", "quantidade CRV")?;
++        let average_cost = parse_decimal_field(holding, "average_cost", "custo médio CRV")?;
++        let group = groups
++            .entry(format!("{account}:{portfolio}:{currency}"))
++            .or_insert_with(|| CrvGroup {
++                account: account.to_string(),
++                account_name: account_name.to_string(),
++                portfolio: portfolio.to_string(),
++                currency: currency.to_string(),
++                positions: Vec::new(),
++            });
++        group.positions.push(crv_holding_input(
++            symbol,
++            market_to_mic(market),
++            currency,
++            quantity,
++            average_cost,
++        ));
++    }
++    Ok((date, groups.into_values().collect(), holdings.len()))
++}
++
++/// What the brokerage pass produced, for the caller's counters and for income.
++pub(super) struct BrokerageOutcome {
++    pub accounts: usize,
++    pub snapshots: usize,
++    pub holdings: usize,
++    /// CB brokerage account → Wealthfolio account that now represents it.
++    pub account_map: HashMap<String, String>,
++}
++
++pub(super) async fn sync_brokerages(
++    state: &AppState,
++    cb_snapshot: &Value,
++    crv_snapshot: &Value,
++    today: &str,
++) -> Result<BrokerageOutcome, String> {
++    let items = validate_cb_snapshot(cb_snapshot)?;
++    let (crv_date, crv_groups, holdings) = parse_crv_groups(crv_snapshot)?;
++    let cb_accounts: Vec<CbAccount> = parse_cb_accounts(items)?
++        .into_iter()
++        .filter(|account| account.brokerage)
++        .collect();
++
++    let mut groups: BTreeMap<(String, String), BrokerGroup> = BTreeMap::new();
++    for crv in crv_groups {
++        let key = broker_key(&crv.account);
++        let group = groups
++            .entry((key.clone(), crv.currency.clone()))
++            .or_insert_with(|| BrokerGroup {
++                marker_source_id: format!(
++                    "{CRV_ACCOUNT_PREFIX}{}:{}:{}",
++                    crv.account, crv.portfolio, crv.currency
++                ),
++                display: broker_display(&key, &crv.account_name),
++                currency: crv.currency.clone(),
++                positions: Vec::new(),
++                crv_holdings: 0,
++                cb_accounts: Vec::new(),
++            });
++        group.crv_holdings += crv.positions.len();
++        group.positions.extend(crv.positions);
++    }
++    for account in cb_accounts {
++        let key = broker_key(&account.institution);
++        let currency = account.currency.clone();
++        groups
++            .entry((key.clone(), currency.clone()))
++            .or_insert_with(|| BrokerGroup {
++                marker_source_id: format!("{CRV_ACCOUNT_PREFIX}{key}:{currency}:{currency}"),
++                display: broker_display(&key, &account.institution),
++                currency: currency.clone(),
++                positions: Vec::new(),
++                crv_holdings: 0,
++                cb_accounts: Vec::new(),
++            })
++            .cb_accounts
++            .push(account);
++    }
++
++    let reference_date = cb_snapshot
++        .get("snapshot_as_of")
++        .and_then(Value::as_str)
++        .map(str::to_string);
++    let mut outcome = BrokerageOutcome {
++        accounts: 0,
++        snapshots: 0,
++        holdings,
++        account_map: HashMap::new(),
++    };
++    let mut active = BTreeSet::new();
++    for group in groups.into_values() {
++        active.insert(marker(&group.marker_source_id));
++        let account = ensure_source_account(
++            state,
++            &AccountSpec {
++                marker: marker(&group.marker_source_id),
++                provider: CRV_PROVIDER,
++                provider_account_id: &group.marker_source_id,
++                name: format!("{} · {}", group.display, group.currency),
++                currency: &group.currency,
++                account_type: account_types::SECURITIES,
++                group: Some(GROUP_BROKERAGE),
++                tracking_mode: TrackingMode::Holdings,
++            },
++        )
++        .await?;
++        outcome.accounts += 1;
++
++        // The CB publishes the cash; a missing balance is never a zero balance.
++        let mut cash: Option<Decimal> = None;
++        let mut cash_date: Option<NaiveDate> = None;
++        for cb in &group.cb_accounts {
++            outcome
++                .account_map
++                .insert(cb.source_id.clone(), account.id.clone());
++            let Some(balance) = cb.balance else { continue };
++            let date = reference_date
++                .clone()
++                .or_else(|| cb.balance_as_of.clone())
++                .unwrap_or_else(|| today.to_string());
++            let date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
++                .map_err(|_| "Conta CB v4 inválida: data do saldo ausente.".to_string())?;
++            cash = Some(cash.unwrap_or(Decimal::ZERO) + balance);
++            cash_date = Some(cash_date.map_or(date, |current| current.max(date)));
++            if group.cb_accounts.len() == 1 {
++                if let (Some(initial), Some(initial_date)) = (cb.initial, cb.initial_date) {
++                    let movements = realized_movements(items, &cb.source_id);
++                    match balance_history(initial, initial_date, &movements, date, balance) {
++                        Some(series) => {
++                            outcome.snapshots += backfill_cb_history(
++                                state,
++                                &account.id,
++                                &account.currency,
++                                &format!("{}>{}", cb.source_id, account.id),
++                                &series,
++                            )
++                            .await?;
++                        }
++                        None => tracing::warn!(
++                            "Patrimonio sync: CB history does not reproduce the published balance; only today is written"
++                        ),
++                    }
++                }
++            }
++        }
++        if cash.is_none() && group.positions.is_empty() {
++            continue;
++        }
++        let snapshot_date = match (cash_date, group.crv_holdings > 0) {
++            (Some(cash_date), true) => cash_date.max(crv_date),
++            (Some(cash_date), false) => cash_date,
++            (None, _) => crv_date,
++        };
++        save_source_snapshot(
++            state,
++            &account.id,
++            &account.currency,
++            snapshot_date,
++            group.positions,
++            cash.map(|amount| {
++                vec![CashBalanceInput {
++                    currency: group.currency.clone(),
++                    amount,
++                }]
++            })
++            .unwrap_or_default(),
++        )
++        .await?;
++        outcome.snapshots += 1;
++    }
++
++    // The old per-source accounts of these brokerages (cash-only, named after
++    // the CB account) are replaced: archived, never deleted.
++    for cb_source_id in outcome.account_map.keys() {
++        let wanted = marker(cb_source_id);
++        for old in accounts_with_marker_prefix(state, &marker(CB_ACCOUNT_PREFIX))? {
++            if old.meta.as_deref() == Some(wanted.as_str()) {
++                archive_account(state, &old).await?;
++            }
++        }
++    }
++
++    // A brokerage that no longer has anything gets an empty snapshot, which the
++    // complete declaration of both sources allows.
++    for stale in accounts_with_marker_prefix(state, &marker(CRV_ACCOUNT_PREFIX))? {
++        if stale
++            .meta
++            .as_deref()
++            .is_some_and(|meta| active.contains(meta))
++        {
++            continue;
++        }
++        save_source_snapshot(
++            state,
++            &stale.id,
++            &stale.currency,
++            crv_date,
++            Vec::new(),
++            Vec::new(),
++        )
++        .await?;
++    }
++    Ok(outcome)
++}
++
++/// The CB side: bank accounts, applications and cards as ledgers, plus the
++/// dividend and lending credits of the brokerages (which carry no balance).
++/// Returns (items, accounts, activities written).
++pub(super) async fn sync_cb_ledger(
++    state: &AppState,
++    snapshot: &Value,
++    today: &str,
++    brokerage_accounts: Option<&HashMap<String, String>>,
++) -> Result<(usize, usize, usize), String> {
++    let items = validate_cb_snapshot(snapshot)?;
++    let reference_date = snapshot
++        .get("snapshot_as_of")
++        .and_then(Value::as_str)
++        .map(str::to_string);
++    let accounts = parse_cb_accounts(items)?;
++    let categories = parse_categories(items);
++    let entries = parse_ledger_entries(items);
++
++    struct Ledger<'a> {
++        account: &'a CbAccount,
++        wealthfolio_id: String,
++        initial: Decimal,
++        initial_date: NaiveDate,
++        include_opening_day: bool,
++        newly_created: bool,
++    }
++    let mut ledgers: Vec<Ledger> = Vec::new();
++    for account in accounts.iter().filter(|account| !account.brokerage) {
++        // A missing balance is not a zero balance: the account is left alone.
++        let (Some(balance), Some(initial), Some(initial_date)) =
++            (account.balance, account.initial, account.initial_date)
++        else {
++            continue;
++        };
++        let date = reference_date
++            .clone()
++            .or_else(|| account.balance_as_of.clone())
++            .unwrap_or_else(|| today.to_string());
++        let through = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
++            .map_err(|_| "Conta CB v4 inválida: data do saldo ausente.".to_string())?;
++        let movements = realized_movements(items, &account.source_id);
++        let Some(include_opening_day) =
++            opening_day_reading(initial, initial_date, &movements, through, balance)
++        else {
++            tracing::warn!(
++                "Patrimonio sync: the CB ledger of one account does not reproduce its balance; account left as it was"
++            );
++            continue;
++        };
++        let synced = ensure_source_account(
++            state,
++            &AccountSpec {
++                marker: marker(&account.source_id),
++                provider: CB_PROVIDER,
++                provider_account_id: &account.source_id,
++                name: ledger_account_name(account),
++                currency: &account.currency,
++                account_type: account.kind.account_type(),
++                group: Some(account.kind.group()),
++                tracking_mode: TrackingMode::Transactions,
++            },
++        )
++        .await?;
++        if synced.created {
++            if let Err(error) = state
++                .spending_settings_service
++                .auto_include_account(&synced.id)
++                .await
++            {
++                tracing::warn!("Patrimonio sync: could not include an account in Spending: {error}");
++            }
++        }
++        ledgers.push(Ledger {
++            account,
++            wealthfolio_id: synced.id,
++            initial,
++            initial_date,
++            include_opening_day,
++            newly_created: synced.created,
++        });
++    }
++    let _ = ledgers.iter().filter(|ledger| ledger.newly_created).count();
++
++    let by_source: HashMap<&str, &Ledger> = ledgers
++        .iter()
++        .map(|ledger| (ledger.account.source_id.as_str(), ledger))
++        .collect();
++    let through_of = |ledger: &Ledger| -> NaiveDate {
++        reference_date
++            .as_deref()
++            .or(ledger.account.balance_as_of.as_deref())
++            .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
++            .or_else(|| NaiveDate::parse_from_str(today, "%Y-%m-%d").ok())
++            .unwrap_or(ledger.initial_date)
++    };
++    let selected: Vec<&LedgerEntry> = entries
++        .iter()
++        .filter(|entry| {
++            by_source.get(entry.account.as_str()).is_some_and(|ledger| {
++                entry.date <= through_of(ledger)
++                    && if ledger.include_opening_day {
++                        entry.date >= ledger.initial_date
++                    } else {
++                        entry.date > ledger.initial_date
++                    }
++            })
++        })
++        .collect();
++    let paired = paired_transfer_groups(&selected);
++
++    let mut desired: Vec<Desired> = Vec::new();
++    let mut managed: BTreeSet<String> = BTreeSet::new();
++    for ledger in &ledgers {
++        managed.insert(ledger.wealthfolio_id.clone());
++        if let Some(opening) = opening_activity(
++            ledger.account,
++            &ledger.wealthfolio_id,
++            ledger.initial,
++            ledger.initial_date,
++        ) {
++            desired.push(opening);
++        }
++    }
++    for entry in &selected {
++        let ledger = by_source[entry.account.as_str()];
++        let name = categories
++            .get(&entry.category_id)
++            .map(|category| category.name.as_str())
++            .unwrap_or_default();
++        let group = if entry.transfer_like {
++            let id = entry
++                .transfer_id
++                .clone()
++                .unwrap_or_else(|| entry.key.clone());
++            let external = !paired.contains(&id);
++            Some((id, external))
++        } else {
++            None
++        };
++        desired.push(entry_activity(
++            entry,
++            ledger.account.kind,
++            &ledger.wealthfolio_id,
++            name,
++            group,
++        ));
++    }
++
++    // Brokerage income (dividend, JCP, share lending): activities that carry no
++    // balance, because those accounts stay in holdings mode.
++    if let Some(brokerages) = brokerage_accounts {
++        for account_id in brokerages.values() {
++            managed.insert(account_id.clone());
++        }
++        for entry in parse_income_entries(items) {
++            let Some(account_id) = brokerages.get(&entry.account_source_id) else {
++                continue;
++            };
++            if entry.kind == IncomeKind::Dividend && entry.symbol.is_none() {
++                continue;
++            }
++            let json = income_activity_json(&entry, account_id);
++            desired.push(Desired {
++                key: entry.key.clone(),
++                account_id: account_id.clone(),
++                activity_type: entry.kind.activity_type().to_string(),
++                amount: entry.amount,
++                currency: entry.currency.clone(),
++                date: entry.date,
++                group_id: None,
++                json,
++                category: None,
++            });
++        }
++    }
++
++    let (created, removed, failed) = reconcile_activities(state, &desired, &managed).await?;
++    if created > 0 || removed > 0 {
++        tracing::info!("Patrimonio sync: CB activities created={created} removed={removed}");
++    }
++    assign_categories(state, &desired, &managed).await;
++    if failed > 0 {
++        return Err(format!(
++            "{failed} atividades do CB não foram gravadas; a próxima execução tenta de novo."
++        ));
++    }
++    Ok((items.len(), ledgers.len(), created))
++}
++
++/// The CB coverage the importer needs before it applies or clears anything:
++/// the three collections declared complete and the declared counts matching.
++pub(super) fn validate_cb_snapshot(snapshot: &Value) -> Result<&Vec<Value>, String> {
++    let items = snapshot
++        .get("items")
++        .and_then(Value::as_array)
++        .ok_or_else(|| "Snapshot CB v4 inválido: lista de itens ausente.".to_string())?;
++    let coverage = snapshot.get("coverage");
++    for name in ["account", "cash_entry", "category"] {
++        let declared = coverage
++            .and_then(|coverage| coverage.get(name))
++            .and_then(|value| value.get("count"))
++            .and_then(Value::as_u64);
++        let found = items
++            .iter()
++            .filter(|item| item.get("resource").and_then(Value::as_str) == Some(name))
++            .count() as u64;
++        let state_ok = coverage
++            .and_then(|coverage| coverage.get(name))
++            .and_then(|value| value.get("state"))
++            .and_then(Value::as_str)
++            == Some("complete");
++        if !state_ok || declared != Some(found) {
++            return Err(format!(
++                "Snapshot CB v4 inválido: cobertura de {name} incompleta."
++            ));
++        }
++    }
++    Ok(items)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn day(text: &str) -> NaiveDate {
++        NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
++    }
++
++    fn dec(text: &str) -> Decimal {
++        text.parse().unwrap()
++    }
++
++    fn cb_account(kind: CbKind, initial: &str) -> CbAccount {
++        CbAccount {
++            source_id: "controle-bancario:account:1".into(),
++            name: "Conta 01".into(),
++            currency: "BRL".into(),
++            kind,
++            owner: "Mariano".into(),
++            institution: "Mercado Pago".into(),
++            brokerage: false,
++            initial: Some(dec(initial)),
++            initial_date: Some(day("2025-12-31")),
++            balance: None,
++            balance_as_of: None,
++        }
++    }
++
++    fn entry(key: &str, income: bool, transfer_like: bool, amount: &str, description: &str) -> LedgerEntry {
++        LedgerEntry {
++            key: key.into(),
++            account: "controle-bancario:account:1".into(),
++            date: day("2026-03-10"),
++            amount: dec(amount),
++            currency: "BRL".into(),
++            income,
++            transfer_like,
++            category_id: "cat".into(),
++            transfer_id: None,
++            description: description.into(),
++        }
++    }
++
++    /// Signed cash effect, the way the holdings engine reads the type.
++    fn cash_effect(desired: &Desired) -> Decimal {
++        match desired.activity_type.as_str() {
++            "CREDIT" | "DEPOSIT" | "DIVIDEND" | "INTEREST" | "TRANSFER_IN" => desired.amount,
++            "WITHDRAWAL" | "TRANSFER_OUT" => -desired.amount,
++            other => panic!("unexpected type {other}"),
++        }
++    }
++
++    #[test]
++    fn brokers_are_found_by_institution_or_crv_account_name() {
++        assert_eq!(broker_key("SCP XP Investimentos"), "xp");
++        assert_eq!(broker_key("XP"), "xp");
++        assert_eq!(broker_key("Genial"), "genial");
++        assert_eq!(broker_key("avenue"), "avenue");
++        assert_eq!(broker_key("Banco Inter"), "bancointer");
++        assert_eq!(broker_display("xp", "SCP XP Investimentos"), "XP");
++        assert_eq!(broker_display("bancointer", " Banco Inter "), "Banco Inter");
++    }
++
++    #[test]
++    fn names_carry_owner_institution_and_account() {
++        let mut checking = cb_account(CbKind::Checking, "0");
++        assert_eq!(ledger_account_name(&checking), "Mariano · Mercado Pago · Conta 01");
++        checking.owner = String::new();
++        assert_eq!(ledger_account_name(&checking), "Mercado Pago · Conta 01");
++    }
++
++    #[test]
++    fn the_opening_day_reading_is_the_one_that_reproduces_the_balance() {
++        let initial = dec("100");
++        let opening = day("2025-12-31");
++        let movements = vec![(opening, dec("10")), (day("2026-01-05"), dec("-30"))];
++        // Entries of the opening day come on top of the opening balance.
++        assert_eq!(
++            opening_day_reading(initial, opening, &movements, day("2026-02-01"), dec("80")),
++            Some(true)
++        );
++        // Entries of the opening day are already inside it.
++        assert_eq!(
++            opening_day_reading(initial, opening, &movements, day("2026-02-01"), dec("70")),
++            Some(false)
++        );
++        assert_eq!(
++            opening_day_reading(initial, opening, &movements, day("2026-02-01"), dec("999")),
++            None
++        );
++        // A later entry is not part of the balance of an earlier day.
++        assert_eq!(
++            opening_day_reading(initial, opening, &movements, day("2026-01-01"), dec("110")),
++            Some(true)
++        );
++    }
++
++    #[test]
++    fn the_opening_balance_is_one_neutral_movement() {
++        let positive = opening_activity(
++            &cb_account(CbKind::Checking, "6195.58"),
++            "wf",
++            dec("6195.58"),
++            day("2025-12-31"),
++        )
++        .unwrap();
++        assert_eq!(positive.activity_type, "CREDIT");
++        assert_eq!(cash_effect(&positive), dec("6195.58"));
++        assert_eq!(positive.json["activityDate"], "2025-12-31T12:00:00.000Z");
++        assert!(positive.json.get("subtype").is_none());
++
++        let owed = opening_activity(
++            &cb_account(CbKind::Card, "-2458.33"),
++            "wf",
++            dec("-2458.33"),
++            day("2025-12-31"),
++        )
++        .unwrap();
++        assert_eq!(owed.activity_type, "WITHDRAWAL");
++        assert_eq!(cash_effect(&owed), dec("-2458.33"));
++
++        assert!(
++            opening_activity(&cb_account(CbKind::Checking, "0"), "wf", dec("0"), day("2025-12-31"))
++                .is_none()
++        );
++    }
++
++    #[test]
++    fn spending_income_and_transfers_get_their_own_types() {
++        let expense = entry_activity(
++            &entry("e1", false, false, "50.00", "Mercado"),
++            CbKind::Checking,
++            "wf",
++            "Supermercado",
++            None,
++        );
++        assert_eq!(expense.activity_type, "WITHDRAWAL");
++        assert_eq!(expense.category.as_ref().unwrap().0, SPENDING_TAXONOMY);
++
++        let income = entry_activity(
++            &entry("e2", true, false, "900.00", "Salário"),
++            CbKind::Checking,
++            "wf",
++            "DBR",
++            None,
++        );
++        assert_eq!(income.activity_type, "DEPOSIT");
++        assert_eq!(income.category.as_ref().unwrap().0, INCOME_TAXONOMY);
++
++        let refund = entry_activity(
++            &entry("e3", true, false, "12.00", "Estorno"),
++            CbKind::Card,
++            "wf",
++            "Lazer",
++            None,
++        );
++        assert_eq!(refund.activity_type, "CREDIT");
++        assert_eq!(refund.json["subtype"], "REFUND");
++        assert_eq!(refund.category.as_ref().unwrap().0, SPENDING_TAXONOMY);
++
++        let out = entry_activity(
++            &entry("e4", false, true, "10000.00", "Para Mercado Bitcoin"),
++            CbKind::Checking,
++            "wf",
++            "Aplicações",
++            Some(("g1".into(), true)),
++        );
++        assert_eq!(out.activity_type, "TRANSFER_OUT");
++        assert_eq!(out.group_id.as_deref(), Some("g1"));
++        assert!(out.category.is_none());
++        assert_eq!(out.json["sourceGroupId"], "g1");
++        let metadata: Value = serde_json::from_str(out.json["metadata"].as_str().unwrap()).unwrap();
++        assert_eq!(metadata["flow"]["is_external"], true);
++
++        let paired = entry_activity(
++            &entry("e5", true, true, "10000.00", "De conta"),
++            CbKind::Savings,
++            "wf",
++            "Transferência Entre Contas",
++            Some(("g2".into(), false)),
++        );
++        assert_eq!(paired.activity_type, "TRANSFER_IN");
++        assert!(paired.json.get("metadata").is_none());
++    }
++
++    #[test]
++    fn income_categories_keep_their_income_types() {
++        let name = "Aluguel de Açoes / Dividendos / JCP";
++        let dividend = entry_activity(
++            &entry("d1", true, false, "149.73", "Cred Reembolso Jcp-Btc Brbbasacnor3 0,00"),
++            CbKind::Checking,
++            "wf",
++            name,
++            None,
++        );
++        assert_eq!(dividend.activity_type, "DIVIDEND");
++        assert_eq!(dividend.json["asset"]["symbol"], "BBAS3");
++        assert!(dividend.category.is_none());
++
++        let orphan = entry_activity(
++            &entry("d2", true, false, "10.00", "Dividendos"),
++            CbKind::Checking,
++            "wf",
++            name,
++            None,
++        );
++        assert_eq!(orphan.activity_type, "DEPOSIT");
++        assert!(orphan.json.get("asset").is_none());
++
++        let lending = entry_activity(
++            &entry("d3", true, false, "30.00", "Taxa de Remuneração Emprestimo Ações Brsmtoacnor3"),
++            CbKind::Checking,
++            "wf",
++            name,
++            None,
++        );
++        assert_eq!(lending.activity_type, "INTEREST");
++        assert_eq!(lending.json["asset"]["symbol"], "SMTO3");
++        assert_eq!(lending.category.as_ref().unwrap().0, INCOME_TAXONOMY);
++    }
++
++    #[test]
++    fn only_a_real_pair_is_linked() {
++        let mut out = entry("t-out", false, true, "100.00", "Pix");
++        out.transfer_id = Some("t".into());
++        let mut inn = entry("t-in", true, true, "100.00", "Pix");
++        inn.account = "controle-bancario:account:2".into();
++        inn.transfer_id = Some("t".into());
++        assert_eq!(
++            paired_transfer_groups(&[&out, &inn]),
++            BTreeSet::from(["t".to_string()])
++        );
++        // The other leg is outside the ledger.
++        assert!(paired_transfer_groups(&[&out]).is_empty());
++        // Same account on both legs, or different amounts: not a pair.
++        let mut same_account = inn.clone();
++        same_account.account = out.account.clone();
++        assert!(paired_transfer_groups(&[&out, &same_account]).is_empty());
++        let mut other_amount = inn.clone();
++        other_amount.amount = dec("99.00");
++        assert!(paired_transfer_groups(&[&out, &other_amount]).is_empty());
++        // A gerencial entry never joins a group.
++        let mut gerencial = inn;
++        gerencial.transfer_like = false;
++        assert!(paired_transfer_groups(&[&out, &gerencial]).is_empty());
++    }
++
++    #[test]
++    fn a_ledger_that_reproduces_the_balance_adds_up_to_it() {
++        let items: Vec<Value> = serde_json::from_str(
++            r#"[
++              {"resource":"category","source_id":"c-g","payload":{"source_id":"c-g","name":"Supermercado"}},
++              {"resource":"category","source_id":"c-i","payload":{"source_id":"c-i","name":"DBR"}},
++              {"resource":"category","source_id":"c-t","payload":{"source_id":"c-t","name":"Transferência Entre Contas"}},
++              {"resource":"cash_entry","source_id":"e1","payload":{"account_id":"a","category_id":"c-g","category_kind":"gerencial","status":"realizado","entry_type":"despesa","realized_date":"2026-01-10","realized_amount":"250.40","currency":"BRL","description":"Mercado"}},
++              {"resource":"cash_entry","source_id":"e2","payload":{"account_id":"a","category_id":"c-i","category_kind":"gerencial","status":"realizado","entry_type":"receita","realized_date":"2026-01-12","realized_amount":"1000.00","currency":"BRL","description":"Pagamento"}},
++              {"resource":"cash_entry","source_id":"e3","payload":{"account_id":"a","category_id":"c-t","category_kind":"transferencia","transfer_id":"t1","status":"realizado","entry_type":"despesa","realized_date":"2026-01-15","realized_amount":"300.00","currency":"BRL","description":"Pix"}},
++              {"resource":"cash_entry","source_id":"e4","payload":{"account_id":"a","category_id":"c-g","category_kind":"gerencial","status":"a_vencer","entry_type":"despesa","realized_date":null,"realized_amount":null,"currency":"BRL","description":"Previsto"}},
++              {"resource":"cash_entry","source_id":"e5","payload":{"account_id":"b","category_id":"c-g","category_kind":"gerencial","status":"realizado","entry_type":"despesa","realized_date":"2026-01-11","realized_amount":"7.00","currency":"BRL","description":"Outra conta"}}
++            ]"#,
++        )
++        .unwrap();
++        let categories = parse_categories(&items);
++        let entries = parse_ledger_entries(&items);
++        assert_eq!(entries.len(), 4, "only realized entries");
++
++        let mut account = cb_account(CbKind::Checking, "100.00");
++        account.source_id = "a".into();
++        let movements = realized_movements(&items, "a");
++        let balance = dec("100.00") - dec("250.40") + dec("1000.00") - dec("300.00");
++        let include_opening_day = opening_day_reading(
++            dec("100.00"),
++            day("2025-12-31"),
++            &movements,
++            day("2026-01-31"),
++            balance,
++        )
++        .expect("the ledger reproduces the balance");
++        assert!(!include_opening_day);
++
++        let selected: Vec<&LedgerEntry> = entries
++            .iter()
++            .filter(|entry| entry.account == "a" && entry.date > day("2025-12-31"))
++            .collect();
++        let paired = paired_transfer_groups(&selected);
++        let mut desired =
++            vec![opening_activity(&account, "wf", dec("100.00"), day("2025-12-31")).unwrap()];
++        for entry in &selected {
++            let group = entry.transfer_like.then(|| {
++                let id = entry.transfer_id.clone().unwrap_or_else(|| entry.key.clone());
++                let external = !paired.contains(&id);
++                (id, external)
++            });
++            let name = categories[&entry.category_id].name.as_str();
++            desired.push(entry_activity(entry, CbKind::Checking, "wf", name, group));
++        }
++        let total: Decimal = desired.iter().map(cash_effect).sum();
++        assert_eq!(total, balance);
++        assert_eq!(desired.len(), 4);
++    }
++
++    #[test]
++    fn the_cb_snapshot_must_declare_its_collections_complete() {
++        let complete: Value = serde_json::from_str(
++            r#"{"items":[{"resource":"account","payload":{}},{"resource":"category","payload":{}},{"resource":"cash_entry","payload":{}}],
++                "coverage":{"account":{"state":"complete","count":1},"category":{"state":"complete","count":1},"cash_entry":{"state":"complete","count":1}}}"#,
++        )
++        .unwrap();
++        assert!(validate_cb_snapshot(&complete).is_ok());
++        let mut partial = complete.clone();
++        partial["coverage"]["cash_entry"]["state"] = Value::String("partial".into());
++        assert!(validate_cb_snapshot(&partial).is_err());
++        let mut miscounted = complete;
++        miscounted["coverage"]["account"]["count"] = Value::from(2);
++        assert!(validate_cb_snapshot(&miscounted).is_err());
++    }
++
++    #[test]
++    fn crv_positions_are_grouped_by_account_portfolio_and_currency() {
++        let snapshot: Value = serde_json::from_str(
++            r#"{"data_de_referencia":"2026-10-16","coverage":{"holdings":{"complete":true}},
++                "holdings":[
++                  {"instrument_type":"equity","account":"genial","portfolio":"BRL","account_name":"Genial","instrument":"BBAS3","currency":"BRL","market":"B3","quantity":"100","average_cost":"20.5"},
++                  {"instrument_type":"equity","account":"genial","portfolio":"BRL","account_name":"Genial","instrument":"EALT4","currency":"BRL","market":"B3","quantity":"10","average_cost":"8"},
++                  {"instrument_type":"equity","account":"genial","portfolio":"USD","account_name":"Genial","instrument":"SGOV","currency":"USD","market":"NYSE","quantity":"1","average_cost":"1"}
++                ]}"#,
++        )
++        .unwrap();
++        let (date, groups, holdings) = parse_crv_groups(&snapshot).unwrap();
++        assert_eq!(date, day("2026-10-16"));
++        assert_eq!(holdings, 3);
++        assert_eq!(groups.len(), 2);
++        let brl = groups.iter().find(|group| group.currency == "BRL").unwrap();
++        assert_eq!(brl.positions.len(), 2);
++        assert_eq!(brl.account, "genial");
++
++        let mut incomplete = snapshot.clone();
++        incomplete["coverage"]["holdings"]["complete"] = Value::Bool(false);
++        assert!(parse_crv_groups(&incomplete).is_err());
++        let mut option = snapshot;
++        option["holdings"][0]["instrument_type"] = Value::String("option".into());
++        assert!(parse_crv_groups(&option).is_err());
++    }
++}
