@@ -1,0 +1,112 @@
+diff --git a/apps/server/src/api/patrimonio_sync/ledger.rs b/apps/server/src/api/patrimonio_sync/ledger.rs
+index 24628f1b1..89a18e20e 100644
+--- a/apps/server/src/api/patrimonio_sync/ledger.rs
++++ b/apps/server/src/api/patrimonio_sync/ledger.rs
+@@ -582,28 +582,65 @@ async fn reconcile_activities(
+             Err(_) => failed += 1,
+         }
+     }
+-    let created_total = creates.len();
+     let mut created = 0;
+     while !creates.is_empty() {
+         let rest = creates.split_off(creates.len().min(BULK_CHUNK));
+         let batch = std::mem::replace(&mut creates, rest);
+-        let attempted = batch.len();
+-        let result = state
+-            .activity_service
+-            .bulk_mutate_activities(ActivityBulkMutationRequest {
+-                creates: batch,
+-                updates: Vec::new(),
+-                delete_ids: Vec::new(),
+-            })
+-            .await
+-            .map_err(|_| "Não foi possível gravar as atividades do CB.".to_string())?;
+-        failed += result.errors.len();
+-        created += attempted.saturating_sub(result.errors.len());
++        let (written, rejected) = create_isolating(state, batch).await?;
++        created += written;
++        failed += rejected;
+     }
+-    debug_assert!(created <= created_total);
+     Ok((created, removed, failed))
+ }
+ 
++async fn bulk_create(
++    state: &AppState,
++    batch: Vec<NewActivity>,
++) -> Result<wealthfolio_core::activities::ActivityBulkMutationResult, String> {
++    state
++        .activity_service
++        .bulk_mutate_activities(ActivityBulkMutationRequest {
++            creates: batch,
++            updates: Vec::new(),
++            delete_ids: Vec::new(),
++        })
++        .await
++        .map_err(|_| "Não foi possível gravar as atividades do CB.".to_string())
++}
++
++/// One bulk call writes nothing at all when any row of it is invalid, so a
++/// chunk that comes back with errors is retried row by row: the valid rows are
++/// saved, and only the invalid ones are counted and named in the log.
++/// Returns (written, rejected).
++async fn create_isolating(
++    state: &AppState,
++    batch: Vec<NewActivity>,
++) -> Result<(usize, usize), String> {
++    let attempted = batch.len();
++    let result = bulk_create(state, batch.clone()).await?;
++    if result.errors.is_empty() {
++        return Ok((attempted, 0));
++    }
++    let mut written = 0;
++    let mut rejected = 0;
++    for activity in batch {
++        let key = activity.idempotency_key.clone().unwrap_or_default();
++        let single = bulk_create(state, vec![activity]).await?;
++        if single.errors.is_empty() {
++            written += 1;
++        } else {
++            rejected += 1;
++            for error in &single.errors {
++                tracing::warn!(
++                    "Patrimonio sync: activity {key} was not written: {}",
++                    error.message
++                );
++            }
++        }
++    }
++    Ok((written, rejected))
++}
++
+ // ---------------------------------------------------------------------------
+ // Categories
+ // ---------------------------------------------------------------------------
+@@ -774,6 +811,18 @@ async fn archive_account(state: &AppState, existing: &Account) -> Result<(), Str
+     Ok(())
+ }
+ 
++/// Whether the account already has a snapshot with positions before `date`.
++/// The CB cash history is written without positions, so rewriting it over such
++/// a history would erase them; the history that exists is kept as it is.
++fn has_position_history(state: &AppState, account_id: &str, date: NaiveDate) -> bool {
++    let before = date.pred_opt().unwrap_or(date);
++    state
++        .snapshot_service
++        .get_snapshot_metadata(account_id, None, Some(before))
++        .map(|snapshots| snapshots.iter().any(|snapshot| snapshot.position_count > 0))
++        .unwrap_or(false)
++}
++
+ struct BrokerGroup {
+     marker_source_id: String,
+     display: String,
+@@ -955,7 +1004,7 @@ pub(super) async fn sync_brokerages(
+                 .map_err(|_| "Conta CB v4 inválida: data do saldo ausente.".to_string())?;
+             cash = Some(cash.unwrap_or(Decimal::ZERO) + balance);
+             cash_date = Some(cash_date.map_or(date, |current| current.max(date)));
+-            if group.cb_accounts.len() == 1 {
++            if group.cb_accounts.len() == 1 && !has_position_history(state, &account.id, date) {
+                 if let (Some(initial), Some(initial_date)) = (cb.initial, cb.initial_date) {
+                     let movements = realized_movements(items, &cb.source_id);
+                     match balance_history(initial, initial_date, &movements, date, balance) {
