@@ -201,15 +201,16 @@ por esses checks.
 ### Implantar uma mudança de patch no VPS
 
 Depois da checagem local completa (ver [`docs/operacao.md`](docs/operacao.md)),
-publique com commit direto no `main` e `git push`, sem PR e sem esperar nada.
-A regra do `main` continua impedindo apagá-lo ou reescrever o histórico: nada
+publique com commit direto no `main` e `git push`, sem PR e sem esperar nada. A
+regra do `main` continua impedindo apagá-lo ou reescrever o histórico: nada
 de push forçado nem de rebase do `main`. A CI do GitHub roda depois de cada
 push só como aviso e não bloqueia nada; se falhar, investigue. O checkout do
-VPS é somente um espelho do `main`: não faça `git pull`, build ou commit manual
-nele. O deploy roda só quando o usuário mandar; o servidor monta a imagem a
-partir do código do `main`, sem esperar nem baixar nada da CI. Na quarta-feira,
-o `reconstruir-bases.timer` reconstrói só a versão que já está no ar, para
-pegar correções de segurança das imagens-base, sem trazer commits novos. Para
+VPS é somente um espelho do `main`: não faça `git pull`, build ou commit
+manual nele. O deploy roda só quando o usuário mandar; o servidor monta a
+imagem a partir do código do `main`, sem esperar nem baixar nada da CI. Nada
+muda em produção sem o usuário mandar. As correções de segurança das
+imagens-base (Debian/Python) entram só quando ele pedir: testa localmente com
+as bases novas e depois roda `~/deploy.sh wealthfolio --refresh`. Para
 implantar, execute:
 
 ```bash
