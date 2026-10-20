@@ -201,10 +201,18 @@ por esses checks.
 ### Implantar uma mudança de patch no VPS
 
 Publique por branch, pull request com checks obrigatórios verdes e squash merge.
-O checkout do VPS é somente um espelho do `main`: não faça `git pull`, build ou
-commit manual nele. O timer central verifica diariamente commits com CI verde
-e reconstrói semanalmente as tags-base móveis depois dos testes de imagem. Para
-uma atualização imediata depois do merge, execute:
+O auto-merge está ligado: depois de `gh pr create`, rode
+`gh pr merge <n> --auto --squash`, e o PR entra sozinho quando os checks
+passarem; a branch não precisa estar atualizada em relação ao `main`. Nunca
+`--admin`, push forçado ou rebase em branch publicada. O checkout do VPS é
+somente um espelho do `main`: não faça `git pull`, build ou commit manual nele.
+O deploy é automático: o `atualizar-stacks.timer` roda a cada 5 minutos e,
+quando o `main` avança, espera em silêncio a CI do `main`, faz backup
+verificado e roda `~/deploy.sh wealthfolio`. Ele alerta uma vez se a CI
+reprovar ou o deploy for revertido, e não repete aquele commit até o `main`
+andar de novo. O timer também reconstrói semanalmente as tags-base móveis
+depois dos testes de imagem. Não é preciso esperar a CI nem rodar o deploy à
+mão depois do merge; para adiantar ou repetir um deploy, execute:
 
 ```bash
 ~/deploy.sh wealthfolio

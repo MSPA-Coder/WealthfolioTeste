@@ -11,6 +11,12 @@ novo processo de deploy: o deploy continua exclusivamente no repositório
 | Configuração do serviço | `docker compose config --quiet` e `docker compose -f compose.yaml -f compose.patrimonio-internal.yaml config --quiet` | **CI** executa ambos com valores inofensivos de interpolação | Compose base e override VPS; o health check interno usa a mesma rota `healthz` |
 | Documentação ou `.env.example` | conferir os comandos e variáveis citados contra `compose.yaml` | **CI** ainda protege patches, add-on e Compose; **Imagem** não é necessária se nada que entre nela mudou | não há alteração de runtime |
 
+Os dois `docker build` de patches são a checagem completa e não rodam mais na
+máquina antes do PR: o **Imagem** do PR executa o mesmo build. Durante o
+desenvolvimento, rode só os testes focados no módulo alterado (`cargo test`,
+ver o [`README`](../README.md)), e os builds completos apenas para reproduzir
+uma falha da CI.
+
 ## Limites de segurança e concorrência
 
 - **CI** e **Imagem** cancelam execuções obsoletas da mesma referência porque
