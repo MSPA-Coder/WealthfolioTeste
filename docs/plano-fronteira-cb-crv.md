@@ -128,9 +128,9 @@ real de posição.
 Branch por PR (`feat/`), testes focados no Docker, PR com squash merge e
 auto-merge, CI obrigatória verde (CB: `Qualidade` e `CodeQL`; CRV:
 `Qualidade`, `Contratos de runtime` e `CodeQL`, que rodam o `quality`
-completo). Desde 20/10/2026 o deploy é automático: depois do merge, o
-`atualizar-stacks.timer` do VPS espera a CI do `main`, faz backup verificado e
-roda o `deploy.sh`, sem espera nem comando à mão. A documentação do CB (`docs/architecture.md`,
+completo). Depois do merge, a CI do `main` publica a imagem, e o `deploy.sh`
+roda com o sim do mantenedor a cada vez; ele recusa sozinho enquanto a CI do
+`main` não estiver verde, então ninguém precisa vigiá-la. A documentação do CB (`docs/architecture.md`,
 `docs/domain.md`) e do CRV (`docs/architecture.md`, `AGENTS.md` quando uma regra
 de produto mudar) é atualizada na mesma entrega.
 
