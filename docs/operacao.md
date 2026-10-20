@@ -2,7 +2,11 @@
 
 Esta matriz separa as validações por superfície de mudança. Ela não cria um
 novo processo de deploy: o deploy continua exclusivamente no repositório
-`manutencao`, após os checks aplicáveis estarem verdes.
+`manutencao` (`~/deploy.sh wealthfolio`), só quando o usuário mandar.
+
+A checagem local é a que vale: rode-a completa na máquina antes do commit, que
+vai direto ao `main`, sem PR. Os workflows do GitHub rodam depois de cada push
+só como aviso e não bloqueiam nada; se falharem, investigue.
 
 | Mudança | Checagem local oficial | Gate no GitHub | Compose / sinal de saúde |
 | --- | --- | --- | --- |
@@ -11,21 +15,15 @@ novo processo de deploy: o deploy continua exclusivamente no repositório
 | Configuração do serviço | `docker compose config --quiet` e `docker compose -f compose.yaml -f compose.patrimonio-internal.yaml config --quiet` | **CI** executa ambos com valores inofensivos de interpolação | Compose base e override VPS; o health check interno usa a mesma rota `healthz` |
 | Documentação ou `.env.example` | conferir os comandos e variáveis citados contra `compose.yaml` | **CI** ainda protege patches, add-on e Compose; **Imagem** não é necessária se nada que entre nela mudou | não há alteração de runtime |
 
-Os dois `docker build` de patches são a checagem completa e não rodam mais na
-máquina antes do PR: o **Imagem** do PR executa o mesmo build. Durante o
-desenvolvimento, rode só os testes focados no módulo alterado (`cargo test`,
-ver o [`README`](../README.md)), e os builds completos apenas para reproduzir
-uma falha da CI.
-
 ## Limites de segurança e concorrência
 
 - **CI** e **Imagem** cancelam execuções obsoletas da mesma referência porque
   são apenas validações e não alteram infraestrutura.
 - A atualização de upstream mantém uma execução por vez e abre ou atualiza um
-  único PR. Dependabot mantém no máximo uma PR por ecossistema. Nenhuma dessas
-  PRs é integrada automaticamente: revise os checks e faça o squash merge
-  conscientemente. Não use cancelamento nessas automações, pois elas escrevem
-  branches e pull requests.
+  único PR, que não é integrado automaticamente: revise os checks e faça o
+  squash merge conscientemente. Dependabot mantém no máximo uma PR por
+  ecossistema, com os checks obrigatórios e auto-merge. Não use cancelamento
+  nessas automações, pois elas escrevem branches e pull requests.
 - Não execute `git pull`, build ou `docker compose up` manualmente no checkout
   do VPS. O `~/deploy.sh wealthfolio` faz o backup, fast-forward, build,
   health check e rollback de imagem/código de forma centralizada.

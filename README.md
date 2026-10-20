@@ -200,21 +200,17 @@ por esses checks.
 
 ### Implantar uma mudança de patch no VPS
 
-Publique por branch, pull request com checks obrigatórios verdes e squash merge.
-O auto-merge está ligado: depois de `gh pr create`, rode
-`gh pr merge <n> --auto --squash`, e o PR entra sozinho quando os checks
-passarem; a branch não precisa estar atualizada em relação ao `main`. Nunca
-`--admin`, push forçado ou rebase em branch publicada. O checkout do VPS é
-somente um espelho do `main`: não faça `git pull`, build ou commit manual nele.
-Depois do merge, a CI do `main` roda e valida o commit que o deploy vai usar.
-O deploy de commits novos é só à mão, com autorização do usuário: quando a
-mudança estiver pronta e só faltar o deploy, o agente avisa o usuário e roda o
-comando abaixo somente com o sim dele. Ninguém precisa vigiar a CI do `main`:
-o script recusa sozinho enquanto ela não estiver verde; se ainda estiver
-rodando, tenta-se de novo minutos depois. O `reconstruir-bases.timer` (quartas,
-12:00 UTC) continua reconstruindo as imagens-base e, se o `main` tiver
-avançado, aplica também os commits ainda não implantados.
-`~/deploy.sh --status` mostra VPS × GitHub.
+Depois da checagem local completa (ver [`docs/operacao.md`](docs/operacao.md)),
+publique com commit direto no `main` e `git push`, sem PR e sem esperar nada.
+A regra do `main` continua impedindo apagá-lo ou reescrever o histórico: nada
+de push forçado nem de rebase do `main`. A CI do GitHub roda depois de cada
+push só como aviso e não bloqueia nada; se falhar, investigue. O checkout do
+VPS é somente um espelho do `main`: não faça `git pull`, build ou commit manual
+nele. O deploy roda só quando o usuário mandar; o servidor monta a imagem a
+partir do código do `main`, sem esperar nem baixar nada da CI. Na quarta-feira,
+o `reconstruir-bases.timer` reconstrói só a versão que já está no ar, para
+pegar correções de segurança das imagens-base, sem trazer commits novos. Para
+implantar, execute:
 
 ```bash
 ~/deploy.sh wealthfolio
@@ -223,7 +219,7 @@ avançado, aplica também os commits ainda não implantados.
 O script central atualiza por fast-forward, reconstrói com o Compose correto,
 aguarda o contêiner e confirma a saúde pelo endereço público. Em falha posterior
 ao fast-forward, restaura o commit e a imagem anteriores. `~/deploy.sh --status`
-continua disponível apenas para diagnóstico transversal.
+compara VPS × GitHub.
 
 Antes de cada deploy ou reconstrução, o fluxo central exige backup verificado.
 O rollback restaura a imagem e o código anteriores, mas não reverte migrações

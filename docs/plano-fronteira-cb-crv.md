@@ -123,14 +123,11 @@ real de posição.
 6. **Aceite**: abertura mais execuções reproduz a posição do myProfit em
    quantidade para Genial e XP (8 ativos mais as opções).
 
-## Como cada PR chega à produção
+## Como cada entrega chega à produção
 
-Branch por PR (`feat/`), testes focados no Docker, PR com squash merge e
-auto-merge, CI obrigatória verde (CB: `Qualidade` e `CodeQL`; CRV:
-`Qualidade`, `Contratos de runtime` e `CodeQL`, que rodam o `quality`
-completo). Depois do merge, a CI do `main` publica a imagem, e o `deploy.sh`
-roda com o sim do mantenedor a cada vez; ele recusa sozinho enquanto a CI do
-`main` não estiver verde, então ninguém precisa vigiá-la. A documentação do CB (`docs/architecture.md`,
+Desde 20/10/2026: `quality` completo verde no Docker, na máquina, e commit
+direto no `main` com `git push`, sem PR e sem esperar a CI, que roda depois do
+push só como aviso. O `deploy.sh` roda com o sim do mantenedor a cada vez. A documentação do CB (`docs/architecture.md`,
 `docs/domain.md`) e do CRV (`docs/architecture.md`, `AGENTS.md` quando uma regra
 de produto mudar) é atualizada na mesma entrega.
 
