@@ -206,13 +206,15 @@ O auto-merge está ligado: depois de `gh pr create`, rode
 passarem; a branch não precisa estar atualizada em relação ao `main`. Nunca
 `--admin`, push forçado ou rebase em branch publicada. O checkout do VPS é
 somente um espelho do `main`: não faça `git pull`, build ou commit manual nele.
-O deploy é automático: o `atualizar-stacks.timer` roda a cada 5 minutos e,
-quando o `main` avança, espera em silêncio a CI do `main`, faz backup
-verificado e roda `~/deploy.sh wealthfolio`. Ele alerta uma vez se a CI
-reprovar ou o deploy for revertido, e não repete aquele commit até o `main`
-andar de novo. O timer também reconstrói semanalmente as tags-base móveis
-depois dos testes de imagem. Não é preciso esperar a CI nem rodar o deploy à
-mão depois do merge; para adiantar ou repetir um deploy, execute:
+Depois do merge, a CI do `main` roda e valida o commit que o deploy vai usar.
+O deploy de commits novos é só à mão, com autorização do usuário: quando a
+mudança estiver pronta e só faltar o deploy, o agente avisa o usuário e roda o
+comando abaixo somente com o sim dele. Ninguém precisa vigiar a CI do `main`:
+o script recusa sozinho enquanto ela não estiver verde; se ainda estiver
+rodando, tenta-se de novo minutos depois. O `reconstruir-bases.timer` (quartas,
+12:00 UTC) continua reconstruindo as imagens-base e, se o `main` tiver
+avançado, aplica também os commits ainda não implantados.
+`~/deploy.sh --status` mostra VPS × GitHub.
 
 ```bash
 ~/deploy.sh wealthfolio
