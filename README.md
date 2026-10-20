@@ -71,13 +71,13 @@ The tokens are the ones saved in the add-on page (`cb.token` and `crv.token` in
 its secret vault). Until they exist, the status is `not_configured`, which is not a
 failure.
 
-The mapping is a single rule. CB: one account per cash account, named
-`CB · <name>`, with one cash balance per day; cards, applications and accounts
-without a published balance are not imported. CRV: one account per (account,
-portfolio, currency), named `CRV · <account> · <portfolio>`, in the holdings
-currency, with the open equity positions. An account that leaves a source, which
-the source must declare as a complete collection, gets an empty snapshot instead of
-keeping a stale one.
+CB bank accounts, savings applications and cards use `TRANSACTIONS`: the
+initial balance and realized entries become managed activities. The importer
+only switches an account after its ledger reproduces the published CB balance.
+Missing balances are left unavailable. Brokerage accounts use `HOLDINGS`,
+combining the cash from CB and equity positions from CRV per broker and currency.
+Source checkpoints and complete coverage declarations govern reconciliation;
+incomplete snapshots must not erase valid history.
 
 The accounts are found by the `meta` marker the older add-on wrote
 (`controlePatrimonial:...`), then by provider identity, so accounts created before
@@ -87,6 +87,12 @@ it. A source account with no live account gets a new one.
 
 This deployment is a single Wealthfolio instance: device sync must remain
 disabled because addon storage can be replicated between devices.
+
+The real server integration test covers ledger reconciliation, archived and
+unmanaged accounts, idempotency, partial source failures and scheduling after a
+restart. Run it through [`compose.e2e.yaml`](compose.e2e.yaml), following
+[`tests/e2e-servidor/README.md`](tests/e2e-servidor/README.md). The image workflow
+also runs it against its candidate runtime image.
 
 ## Addon simulation (run before packaging)
 

@@ -1,0 +1,5 @@
+ARG WF_E2E_RUNTIME_IMAGE=wealthfolio-teste:e2e-runtime
+FROM ${WF_E2E_RUNTIME_IMAGE}
+USER root
+RUN apk add --no-cache python3
+USER 1000:1000

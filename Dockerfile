@@ -30,7 +30,7 @@ COPY patches/ /patches/
 # `git apply` sem tolerância de espaço: patch que não casa exato é patch que
 # precisa ser refeito, não ajustado em silêncio.
 RUN cd /src \
- && for patch in /patches/*.patch; do echo "aplicando $patch"; git apply "$patch"; done \
+ && for patch in /patches/*.patch; do echo "aplicando $patch"; git apply "$patch" || exit 1; done \
  && rm -rf .git
 
 # Front-end (Dockerfile do upstream, estágio 1).

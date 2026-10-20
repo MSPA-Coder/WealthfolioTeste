@@ -1,4 +1,9 @@
 .env
+.env.*
+!.env.example
+.secrets/
+.certs/
+/CodexTemp/
 addons/controle-patrimonial-sync/node_modules/
 
 # Artefatos transitórios do build do add-on (o ZIP de release é versionado).

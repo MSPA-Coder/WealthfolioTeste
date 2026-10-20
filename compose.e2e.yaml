@@ -1,0 +1,28 @@
+name: wealthfolio-e2e
+services:
+  servidor-testes:
+    image: wealthfolio-e2e:local
+    build:
+      context: .
+      dockerfile: Dockerfile.e2e
+      args:
+        WF_E2E_RUNTIME_IMAGE: ${WF_E2E_RUNTIME_IMAGE:-wealthfolio-teste:e2e-runtime}
+    entrypoint: [python3, /tests/driver.py, /usr/local/bin/wealthfolio-server]
+    network_mode: none
+    extra_hosts:
+      - cb-api:127.0.0.1
+      - crv-api:127.0.0.1
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: "2.0"
+    mem_limit: 1g
+    pids_limit: 256
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777,size=256m
+    volumes:
+      - ./tests/e2e-servidor:/tests:ro

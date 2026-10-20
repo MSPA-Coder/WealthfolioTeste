@@ -8,9 +8,9 @@ name: Imagem
 on:
   push:
     branches: [main]
-    paths: [Dockerfile, .dockerignore, "patches/**", .github/workflows/imagem.yml]
+    paths: [Dockerfile, Dockerfile.e2e, compose.e2e.yaml, .dockerignore, "patches/**", "tests/e2e-servidor/**", .github/workflows/imagem.yml]
   pull_request:
-    paths: [Dockerfile, .dockerignore, "patches/**", .github/workflows/imagem.yml]
+    paths: [Dockerfile, Dockerfile.e2e, compose.e2e.yaml, .dockerignore, "patches/**", "tests/e2e-servidor/**", .github/workflows/imagem.yml]
   workflow_dispatch:
   schedule:
     - cron: "0 6 * * 2"
@@ -36,6 +36,11 @@ jobs:
       # Reaproveita as camadas do passo anterior: só a imagem final é nova.
       - name: Imagem final
         run: docker build --pull -t wealthfolio-teste:ci .
+
+      - name: Ledger, idempotência e recuperação com servidor real
+        env:
+          WF_E2E_RUNTIME_IMAGE: wealthfolio-teste:ci
+        run: docker compose -f compose.e2e.yaml run --build --rm servidor-testes
 
       # Sobe como no VPS: banco cifrado exigido, chave mestra por arquivo,
       # sistema de arquivos só de leitura e as mesmas restrições do compose.yaml
