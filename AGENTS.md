@@ -29,7 +29,7 @@ somente leitura e rede interna do VPS.
 | --- | --- |
 | Documentação | Conferir comandos, links e coerência com o contrato v4. |
 | Add-on, contrato ou pacote ZIP | Executar os passos de simulação e verificação de pacote em `.github/workflows/ci.yml`. |
-| Patch ou `WEALTHFOLIO_COMMIT` | Confirmar aplicação limpa dos patches e executar `Imagem`, ou seus equivalentes locais de testes, build e healthcheck. |
+| Patch ou `WEALTHFOLIO_COMMIT` | Confirmar aplicação limpa dos patches e os testes focados no módulo alterado; testes, build e healthcheck completos rodam no `Imagem` do PR, e os equivalentes locais só servem para reproduzir uma falha dele. |
 | Compose, Dockerfile, rede ou segredo | `docker compose config --quiet` com valores de teste; validar também `compose.patrimonio-internal.yaml` quando afetado. |
 | Sincronização, agendamento ou dados persistidos | Além do acima, provar reexecução idempotente, recuperação após reinício e ausência de duplicação com dados de teste. |
 | VPS, backup, proxy ou volume | Ler o plano e os scripts canônicos em `manutencao`; validar backup e healthcheck pós-deploy. Não operar VPS sem autorização explícita. |
