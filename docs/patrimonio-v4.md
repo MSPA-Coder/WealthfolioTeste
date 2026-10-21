@@ -54,7 +54,7 @@ trazem só o caminho do campo, nunca o valor.
 
 | Fonte | Recursos | Semântica de importação |
 | --- | --- | --- |
-| CB | `account`, `cash_entry`, `category`, `transfer` | Conta inclui saldo e data iniciais. Lançamento realizado usa data e valor realizados; pendente ou projetado mantém o status. Transferências têm as duas pontas e não são receita ou despesa. |
+| CB | `account`, `cash_entry`, `category`, `transfer` | Conta inclui saldo e data iniciais. Lançamento realizado usa data e valor realizados; pendente ou projetado mantém o status. Transferências têm as duas pontas e não são receita ou despesa. A variação de mercado de Tesouro, renda fixa e caixa em dólar chega como `kind: gerencial` (retorno, não movimentação de capital), com `valuation: true` na categoria (opcional, 21/10/2026) para quem separa o retorno não realizado. |
 | CRV | `holding`, `income`, `price_current`, `price_history`, `position_ledger` | Holdings são fotografias para o modo `HOLDINGS`. Cada holding declara `instrument_type`; no piloto o único valor aceito é `equity`. Renda é provento efetivamente recebido. Preços atuais e diários são informativos. O ledger de posição é prospectivo e não recria caixa. |
 
 ## Endpoints
