@@ -1,0 +1,130 @@
+diff --git a/apps/server/src/api/patrimonio_sync/ledger.rs b/apps/server/src/api/patrimonio_sync/ledger.rs
+index 01902ee..db133d8 100644
+--- a/apps/server/src/api/patrimonio_sync/ledger.rs
++++ b/apps/server/src/api/patrimonio_sync/ledger.rs
+@@ -187,6 +187,11 @@ fn short_hash(text: &str) -> String {
+ #[derive(Clone, Debug)]
+ pub(super) struct CbCategory {
+     pub name: String,
++    /// The CB's market-value change (mark-to-market of Treasury bonds, fixed
++    /// income, dollar cash): published as `gerencial`, so it is return and not a
++    /// capital move, and flagged `valuation` so it is not mistaken for spending
++    /// or income.
++    pub valuation: bool,
+ }
+ 
+ #[derive(Clone, Debug)]
+@@ -214,6 +219,7 @@ pub(super) fn parse_categories(items: &[Value]) -> HashMap<String, CbCategory> {
+                 payload.get("source_id")?.as_str()?.to_string(),
+                 CbCategory {
+                     name: payload.get("name")?.as_str()?.to_string(),
++                    valuation: payload.get("valuation").and_then(Value::as_bool) == Some(true),
+                 },
+             ))
+         })
+@@ -387,6 +393,39 @@ pub(super) fn opening_activity(
+     })
+ }
+ 
++/// A market-value change of the CB (`valuation` category) as one activity.
++///
++/// The balance of the account moves, but no money crossed its boundary: a
++/// DEPOSIT or WITHDRAWAL would be an external flow and a net contribution, and
++/// the gain or loss would vanish from the returns. A gain is a CREDIT without
++/// subtype (adds cash, no contribution, not income). A loss has no neutral cash
++/// type in Wealthfolio, so it is a FEE: it lowers cash and the return, and is
++/// the only internal outflow; it is reported as a charge, which it is not.
++/// Neither gets a spending or income category: it is not spending nor income.
++pub(super) fn valuation_activity(entry: &LedgerEntry, account_id: &str) -> Desired {
++    let activity_type = if entry.income { "CREDIT" } else { "FEE" };
++    let json = base_json(
++        &entry.key,
++        account_id,
++        activity_type,
++        entry.date,
++        &entry.currency,
++        entry.amount,
++        format!("CB: {}", entry.description),
++    );
++    Desired {
++        key: entry.key.clone(),
++        account_id: account_id.to_string(),
++        activity_type: activity_type.to_string(),
++        amount: entry.amount,
++        currency: entry.currency.clone(),
++        date: entry.date,
++        group_id: None,
++        json,
++        category: None,
++    }
++}
++
+ /// One CB entry as one activity of the ledger. `group` is the transfer group
+ /// and whether the other leg lives outside the ledger.
+ pub(super) fn entry_activity(
+@@ -1214,8 +1253,12 @@ pub(super) async fn sync_cb_ledger(
+     }
+     for entry in &selected {
+         let ledger = by_source[entry.account.as_str()];
+-        let name = categories
+-            .get(&entry.category_id)
++        let category = categories.get(&entry.category_id);
++        if !entry.transfer_like && category.is_some_and(|category| category.valuation) {
++            desired.push(valuation_activity(entry, &ledger.wealthfolio_id));
++            continue;
++        }
++        let name = category
+             .map(|category| category.name.as_str())
+             .unwrap_or_default();
+         let group = if entry.transfer_like {
+@@ -1356,11 +1399,49 @@ mod tests {
+     fn cash_effect(desired: &Desired) -> Decimal {
+         match desired.activity_type.as_str() {
+             "CREDIT" | "DEPOSIT" | "DIVIDEND" | "INTEREST" | "TRANSFER_IN" => desired.amount,
+-            "WITHDRAWAL" | "TRANSFER_OUT" => -desired.amount,
++            "WITHDRAWAL" | "TRANSFER_OUT" | "FEE" => -desired.amount,
+             other => panic!("unexpected type {other}"),
+         }
+     }
+ 
++    #[test]
++    fn a_market_value_change_is_return_not_a_capital_move_nor_spending() {
++        let gain = valuation_activity(
++            &entry("v1", true, false, "300.00", "Atualização de saldo: marcação a mercado"),
++            "wf",
++        );
++        // Neutral cash credit: no contribution, not income, no category.
++        assert_eq!(gain.activity_type, "CREDIT");
++        assert!(gain.json.get("subtype").is_none());
++        assert!(gain.category.is_none());
++        assert_eq!(cash_effect(&gain), dec("300.00"));
++
++        let loss = valuation_activity(
++            &entry("v2", false, false, "120.00", "Atualização de saldo: marcação a mercado"),
++            "wf",
++        );
++        // Never a WITHDRAWAL (an external flow that would hide the loss).
++        assert_eq!(loss.activity_type, "FEE");
++        assert!(loss.category.is_none());
++        assert_eq!(cash_effect(&loss), dec("-120.00"));
++    }
++
++    #[test]
++    fn only_the_category_the_cb_flags_as_valuation_is_one() {
++        let items: Vec<Value> = serde_json::from_str(
++            r#"[
++              {"resource":"category","payload":{"source_id":"c1","name":"Variação de mercado","kind":"gerencial","valuation":true}},
++              {"resource":"category","payload":{"source_id":"c2","name":"Rendimentos","kind":"gerencial"}},
++              {"resource":"category","payload":{"source_id":"c3","name":"Outra","kind":"gerencial","valuation":false}}
++            ]"#,
++        )
++        .unwrap();
++        let categories = parse_categories(&items);
++        assert!(categories["c1"].valuation);
++        assert!(!categories["c2"].valuation);
++        assert!(!categories["c3"].valuation);
++    }
++
+     #[test]
+     fn brokers_are_found_by_institution_or_crv_account_name() {
+         assert_eq!(broker_key("SCP XP Investimentos"), "xp");
