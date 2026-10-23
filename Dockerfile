@@ -1,4 +1,4 @@
-# Wealthfolio no último commit upstream validado (v3.10.0), com os patches deste
+# Wealthfolio no último commit upstream validado (v3.11.0), com os patches deste
 # repositório, sem nenhuma pasta fora do Git.
 #
 # Até 03/10/2026 o compose.yaml construía ../CodexTemp/wealthfolio-v3.9.1, uma
@@ -6,7 +6,7 @@
 # estava versionada em lugar nenhum (hoje o patch 0000). Perder o VPS era
 # perder a única forma de reconstruir a imagem que roda. Aqui o código vem do
 # commit fixado da tag, os patches de `patches/` entram na ordem do nome, e o
-# resto repete o Dockerfile do upstream na v3.10.0. As tags das imagens-base
+# resto repete o Dockerfile do upstream na v3.11.0. As tags das imagens-base
 # avançam dentro de suas linhas estáveis; builds semanais testam essas mudanças.
 # Upstream + 0000..0003 foi conferido igual, arquivo a arquivo, ao
 # CodexTemp que estava em produção.
@@ -16,7 +16,7 @@
 
 # O commit da última release estável é atualizado por upstream.yml e só entra
 # depois de os testes de patch, build, startup e CVE passarem.
-ARG WEALTHFOLIO_COMMIT=f9643209e7cafcaf133d5a8fbe1ef2fa4fd7fc04
+ARG WEALTHFOLIO_COMMIT=d1fda0b65f69d8557b1ef80e555c799215ad28b3
 
 # Fonte: upstream no commit fixado + patches, ou o build para.
 FROM alpine:3.24 AS fonte

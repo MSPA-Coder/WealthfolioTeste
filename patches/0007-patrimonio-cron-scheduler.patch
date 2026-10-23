@@ -17,17 +17,17 @@ index 25ddc9e02..e9d11771b 100644
   "futures-core",
   "hkdf 0.12.4",
 diff --git a/Cargo.toml b/Cargo.toml
-index da46e6399..81ad0dbc7 100644
+index 1173e00..61eab5a 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -42,6 +42,7 @@ r2d2 = "0.8"
+@@ -56,6 +56,7 @@ r2d2 = "0.8"
  
  # Time
  chrono = { version = "0.4", features = ["serde"] }
 +chrono-tz = "0.10"
  
  # HTTP
- reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "query", "form", "stream"] }
+ reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "query", "form", "stream", "charset", "http2", "system-proxy"] }
 diff --git a/apps/server/Cargo.toml b/apps/server/Cargo.toml
 index 69ba62e14..2bbd9e3dd 100644
 --- a/apps/server/Cargo.toml
